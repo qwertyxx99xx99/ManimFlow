@@ -195,7 +195,7 @@ r = subprocess.run(
     ["aider","--model","openai/manimator",
      "--openai-api-base",f"http://127.0.0.1:{{LOCAL_PORT}}/v1",
      "--openai-api-key","dummy",
-     "--yes-always","--no-auto-commits",
+     "--yes-always","--no-auto-commits","--no-pretty",
      "--no-show-model-warnings","--no-check-update",
      "--test-cmd","python3 -m manim -pql --disable_caching scene.py AnimScene 2>&1",
      "--auto-test","--message",
@@ -207,6 +207,7 @@ r = subprocess.run(
      "Arrow(start=...,end=...) only | visually complete",
      "plan.md"],
     cwd=str(MANIM_OUTPUT), text=True, timeout=1800, env=aider_env,
+    stderr=subprocess.STDOUT,
 )
 print(f"aider exit: {{r.returncode}}", flush=True)
 
