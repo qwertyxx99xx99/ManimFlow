@@ -151,10 +151,13 @@ except OSError:
     print(f"port {{LOCAL_PORT}} already bound", flush=True)
 
 def _keepalive():
+    import time, urllib.request as _ur
     while True:
-        time.sleep(30)
-        print(".", end="", flush=True)
-import time
+        time.sleep(25)
+        try:
+            _ur.urlopen("http://172.28.0.1:9000/api/kernels", timeout=5)
+        except Exception:
+            pass
 threading.Thread(target=_keepalive, daemon=True).start()
 
 for f in MANIM_OUTPUT.glob("*.py"): f.unlink()
