@@ -112,6 +112,18 @@ aider_env = {
     "GIT_COMMITTER_NAME": "aider", "GIT_COMMITTER_EMAIL": "aider@ci",
 }
 
+print("\n=== Fetching Manim docs ===", flush=True)
+docs_dir = pathlib.Path("manim_docs")
+if not docs_dir.exists():
+    subprocess.run(["git", "clone", "--filter=blob:none", "--no-checkout", "--depth=1",
+                    "https://github.com/ManimCommunity/manim.git", str(docs_dir)], check=True)
+    subprocess.run(["git", "sparse-checkout", "set", "docs/source/reference_index",
+                    "docs/source/tutorials"], cwd=str(docs_dir), check=True)
+    subprocess.run(["git", "checkout"], cwd=str(docs_dir), check=True)
+
+doc_files = list(docs_dir.rglob("*.rst"))
+read_args = [arg for f in doc_files for arg in ["--read", str(f)]]
+
 print("\n=== Aider: coding + auto-fix loop ===", flush=True)
 r = subprocess.run(
     ["aider",
@@ -122,6 +134,7 @@ r = subprocess.run(
      "--no-show-model-warnings", "--no-check-update",
      "--test-cmd", "python3 -m manim -pql --disable_caching scene.py AnimScene 2>&1",
      "--auto-test", "--message", task,
+     *read_args,
      "plan.md"],
     cwd=str(MANIM_OUTPUT), text=True, timeout=1800, env=aider_env,
     stderr=subprocess.STDOUT,
