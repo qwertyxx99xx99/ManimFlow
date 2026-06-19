@@ -31,7 +31,6 @@ jobs:
 
       - name: Cache apt packages
         uses: actions/cache@v4
-        id: apt-cache
         with:
           path: /var/cache/apt/archives
           key: apt-manim-${{ runner.os }}-v2
@@ -73,7 +72,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               comment_id: ${{ steps.start-comment.outputs.comment_id }},
-              body: `🎬 **Render started**\n\nPrompt: \`${context.payload.issue.title}\`\n\n✅ Deps installed\n_⏳ Planning scenes..._`,
+              body: `🎬 **Render in progress**\n\nPrompt: \`${context.payload.issue.title}\`\n\n✅ Deps installed\n_⏳ Planning & rendering..._`,
             });
 
       - name: Run render
@@ -89,7 +88,6 @@ jobs:
 
       - name: Upload video artifact
         if: success()
-        id: upload
         uses: actions/upload-artifact@v4
         with:
           name: animation-${{ github.event.issue.number }}

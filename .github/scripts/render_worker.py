@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 
-import sys, os, subprocess, pathlib, shutil, json, re, threading, urllib.request
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
+import sys, os, subprocess, pathlib, shutil, json, re, urllib.request
 
-_title = os.environ["ISSUE_TITLE"]
-_body = os.environ.get("ISSUE_BODY", "").strip()
-PROMPT = f"{_title}\n\n{_body}" if _body else _title
+PROMPT_TITLE = os.environ["ISSUE_TITLE"]
+PROMPT_BODY = os.environ.get("ISSUE_BODY", "").strip()
+PROMPT = f"{PROMPT_TITLE}\n\n{PROMPT_BODY}" if PROMPT_BODY else PROMPT_TITLE
 COMMENT_ID = os.environ["COMMENT_ID"]
 GH_TOKEN = os.environ["GH_TOKEN"]
 REPO = os.environ["REPO"]
-LOCAL_PORT = 18642
 MANIM_OUTPUT = pathlib.Path("manim_output")
-EXA_URL = "https://demos.exa.ai/chatbot-demo/api/chat/stream"
+
+COPILOT_BASE = "https://api.individual.githubcopilot.com"
+COPILOT_MODEL = "gemini-2.5-pro"
+COPILOT_HEADERS = {
+    "Authorization": f"Bearer {GH_TOKEN}",
+    "Content-Type": "application/json",
+    "Editor-Version": "vscode/1.85.0",
+    "Copilot-Integration-Id": "vscode-chat",
+}
 
 
 def update_comment(body):
@@ -32,81 +37,23 @@ def update_comment(body):
         print(f"[warn] comment update failed: {e}", flush=True)
 
 
-def _strip(t):
-    i = t.find("\n\n```followups")
-    if i >= 0:
-        t = t[:i]
-    return re.sub(r"\n\[.*?\]\s*$", "", t, flags=re.DOTALL).rstrip()
-
-
-def _exa(messages):
-    non_sys = [m for m in messages if m["role"] != "system"]
-    sys_msg = next((m for m in messages if m["role"] == "system"), None)
-    last = non_sys[-1]
-    user_content = (
-        "IMPORTANT: use plain ``` for ALL code blocks, never ```python or ```bash.\n\n"
-        + (sys_msg["content"] if sys_msg else "")
-        + "\n\n" + last["content"]
-    )
+def copilot_chat(messages, max_tokens=2048):
     payload = json.dumps({
-        "message": user_content,
-        "history": [{"role": m["role"], "content": m["content"]} for m in non_sys[:-1]],
-        "exaEnabled": False,
-        "model": "google/gemini-2.5-flash",
-        "searchType": "instant",
+        "model": COPILOT_MODEL,
+        "messages": messages,
+        "max_tokens": max_tokens,
     }).encode()
-    req = urllib.request.Request(EXA_URL, data=payload,
-        headers={"Content-Type": "application/json", "Accept": "text/event-stream"})
-    full = ""; evt = None
+    req = urllib.request.Request(
+        f"{COPILOT_BASE}/chat/completions",
+        data=payload, headers=COPILOT_HEADERS,
+    )
     with urllib.request.urlopen(req, timeout=180) as resp:
-        buf = b""
-        for raw in resp:
-            buf += raw
-            lines = buf.split(b"\n"); buf = lines.pop()
-            for line in lines:
-                t = line.decode("utf-8", errors="replace").strip()
-                if not t: continue
-                if t.startswith("event:"): evt = t[6:].strip()
-                elif t.startswith("data:") and evt == "content":
-                    try: full += json.loads(t[5:].strip()).get("content", "")
-                    except: pass
-    return _strip(full)
+        return json.loads(resp.read())["choices"][0]["message"]["content"].strip()
 
-
-class _TS(ThreadingMixIn, HTTPServer): daemon_threads = True
-class _H(BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
-    def do_GET(self):
-        if self.path == "/v1/models":
-            b = json.dumps({"object": "list", "data": [{"id": "manimator", "object": "model", "created": 0, "owned_by": "exa"}]}).encode()
-            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(b)
-        else:
-            self.send_response(404); self.end_headers()
-    def do_POST(self):
-        if self.path != "/v1/chat/completions": self.send_response(404); self.end_headers(); return
-        n = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(n))
-        try:
-            content = _exa(body.get("messages", []))
-        except Exception as e:
-            self.send_response(500); self.send_header("Content-Type", "application/json"); self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode()); return
-        rb = json.dumps({
-            "id": "chatcmpl-local", "object": "chat.completion", "model": "manimator",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        }).encode()
-        self.send_response(200); self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(rb))); self.end_headers(); self.wfile.write(rb)
-
-
-srv = _TS(("127.0.0.1", LOCAL_PORT), _H)
-threading.Thread(target=srv.serve_forever, daemon=True).start()
-print(f"LLM proxy on :{LOCAL_PORT}", flush=True)
 
 # ── Plan ──────────────────────────────────────────────────────────────────────
 print("\n=== Planning ===", flush=True)
-payload = json.dumps({"model": "manimator", "messages": [
+raw = copilot_chat([
     {"role": "system", "content": (
         "You are a Manim animation planner. Output ONLY a numbered scene plan — "
         "no questions, no clarifications, no preamble, no code blocks. "
@@ -114,13 +61,7 @@ payload = json.dumps({"model": "manimator", "messages": [
         "Plain English per scene: shapes/colors, motion, equations/labels. Never ask anything."
     )},
     {"role": "user", "content": PROMPT},
-], "max_tokens": 2048}).encode()
-req = urllib.request.Request(
-    f"http://127.0.0.1:{LOCAL_PORT}/v1/chat/completions",
-    data=payload, headers={"Content-Type": "application/json", "Authorization": "Bearer dummy"},
-)
-with urllib.request.urlopen(req, timeout=180) as resp:
-    raw = json.loads(resp.read())["choices"][0]["message"]["content"].strip()
+])
 
 raw = re.sub(r"```.*?```", "", raw, flags=re.DOTALL).strip()
 for marker in ["Would you like", "Do you want", "Should I", "Could you clarify",
@@ -134,14 +75,14 @@ scene_count = len([l for l in plan.splitlines() if re.match(r'^\d+\.', l.strip()
 print(f"\n=== Scene Plan ({scene_count} scenes) ===\n{plan}\n{'='*40}", flush=True)
 
 update_comment(
-    f"🎬 **Render in progress**\n\nPrompt: `{PROMPT}`\n\n"
+    f"🎬 **Render in progress**\n\nPrompt: `{PROMPT_TITLE}`\n\n"
     f"✅ Deps installed\n"
     f"✅ Scene plan ({scene_count} scenes)\n"
-    f"_⏳ Writing code & rendering (this takes 10–20 min)..._\n\n"
+    f"_⏳ Writing code & rendering (10–20 min)..._\n\n"
     f"<details><summary>Scene plan</summary>\n\n```\n{plan}\n```\n</details>"
 )
 
-# ── Setup ─────────────────────────────────────────────────────────────────────
+# ── Setup workspace ───────────────────────────────────────────────────────────
 if MANIM_OUTPUT.exists():
     shutil.rmtree(MANIM_OUTPUT)
 MANIM_OUTPUT.mkdir(parents=True)
@@ -153,13 +94,7 @@ subprocess.run(["git", "init"], cwd=str(MANIM_OUTPUT), capture_output=True)
 subprocess.run(["git", "add", "plan.md"], cwd=str(MANIM_OUTPUT), capture_output=True)
 subprocess.run(["git", "commit", "-m", "init"], cwd=str(MANIM_OUTPUT), capture_output=True)
 
-aider_env = {
-    **os.environ,
-    "OPENAI_API_KEY": "dummy",
-    "GIT_AUTHOR_NAME": "aider", "GIT_AUTHOR_EMAIL": "aider@ci",
-    "GIT_COMMITTER_NAME": "aider", "GIT_COMMITTER_EMAIL": "aider@ci",
-}
-
+# ── Aider ─────────────────────────────────────────────────────────────────────
 task = (
     "Read plan.md and implement the animation as a Manim project.\n\n"
     "Write files in this order:\n"
@@ -175,12 +110,19 @@ task = (
     "- Make it visually complete and polished"
 )
 
-# ── Aider ─────────────────────────────────────────────────────────────────────
+aider_env = {
+    **os.environ,
+    "OPENAI_API_KEY": GH_TOKEN,
+    "GIT_AUTHOR_NAME": "aider", "GIT_AUTHOR_EMAIL": "aider@ci",
+    "GIT_COMMITTER_NAME": "aider", "GIT_COMMITTER_EMAIL": "aider@ci",
+}
+
 print("\n=== Aider: coding + auto-fix loop ===", flush=True)
 r = subprocess.run(
-    ["aider", "--model", "openai/manimator",
-     "--openai-api-base", f"http://127.0.0.1:{LOCAL_PORT}/v1",
-     "--openai-api-key", "dummy",
+    ["aider",
+     "--model", f"openai/{COPILOT_MODEL}",
+     "--openai-api-base", COPILOT_BASE,
+     "--openai-api-key", GH_TOKEN,
      "--yes-always", "--no-auto-commits", "--no-pretty",
      "--no-show-model-warnings", "--no-check-update",
      "--test-cmd", "python3 -m manim -pql --disable_caching scene.py AnimScene 2>&1",
