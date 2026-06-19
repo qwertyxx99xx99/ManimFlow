@@ -29,7 +29,6 @@ Planner (Gemini 2.5 Pro via Copilot)
        │  numbered scene list
        ▼
 Aider --auto-test
-       │  reads Manim docs
        │  writes helpers.py, objects.py, scene.py, ...
        │  runs manim after each edit, feeds errors back
        ▼
@@ -56,7 +55,6 @@ Scene count scales to your prompt: short → 3–4 scenes, default → 5–6, de
 |---|---|
 | LLM | GitHub Copilot (Gemini 2.5 Pro) |
 | Agent | [Aider](https://aider.chat) with `--auto-test` |
-| Docs | Manim docs sparse-cloned at runtime as aider context |
 | Animation | [Manim Community](https://www.manim.community/) |
 | CI | GitHub Actions (ubuntu-latest, ~10–20 min per render) |
 

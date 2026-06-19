@@ -80,26 +80,9 @@ subprocess.run(["git", "init"], cwd=str(MANIM_OUTPUT), capture_output=True)
 subprocess.run(["git", "add", "plan.md"], cwd=str(MANIM_OUTPUT), capture_output=True)
 subprocess.run(["git", "commit", "-m", "init"], cwd=str(MANIM_OUTPUT), capture_output=True)
 
-# ── Fetch Manim docs ──────────────────────────────────────────────────────────
-print("\n=== Fetching Manim docs ===", flush=True)
-docs_dir = pathlib.Path("manim_docs")
-if not docs_dir.exists():
-    subprocess.run(["git", "clone", "--filter=blob:none", "--no-checkout", "--depth=1",
-                    "https://github.com/ManimCommunity/manim.git", str(docs_dir)], check=True)
-    subprocess.run(["git", "sparse-checkout", "init", "--cone"], cwd=str(docs_dir), check=True)
-    subprocess.run(["git", "sparse-checkout", "set",
-                    "docs/source/reference_index", "docs/source/tutorials"],
-                   cwd=str(docs_dir), check=True)
-    subprocess.run(["git", "checkout", "main"], cwd=str(docs_dir), check=True)
-
-doc_files = list(docs_dir.rglob("*.rst"))
-read_args = [arg for f in doc_files for arg in ["--read", str(f.resolve())]]
-print(f"Loaded {len(doc_files)} doc files", flush=True)
-
 # ── Aider ─────────────────────────────────────────────────────────────────────
 task = (
     "Read plan.md and implement it as a Manim animation project.\n\n"
-    "Consult the provided Manim docs (--read files) for correct API usage.\n\n"
     "Structure:\n"
     "- Helper modules first (objects.py, helpers.py, etc.)\n"
     "- scene.py last, defines AnimScene(Scene), imports from helpers\n\n"
@@ -124,7 +107,6 @@ r = subprocess.run(
      "--no-show-model-warnings", "--no-check-update",
      "--test-cmd", "python3 -m manim -pql --disable_caching scene.py AnimScene 2>&1",
      "--auto-test", "--message", task,
-     *read_args,
      "plan.md"],
     cwd=str(MANIM_OUTPUT), text=True, timeout=1800, env=aider_env,
     stderr=subprocess.STDOUT,
