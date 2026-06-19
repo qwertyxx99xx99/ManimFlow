@@ -49,16 +49,22 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Cache pip packages
+      - name: Cache virtualenv
+        id: venv-cache
         uses: actions/cache@v4
         with:
-          path: ~/.cache/pip
-          key: pip-manim-py311-v1
+          path: .venv
+          key: venv-manim-py311-v1
 
       - name: Install Python deps
+        if: steps.venv-cache.outputs.cache-hit != 'true'
         run: |
-          pip install -q numpy==1.26.4 scipy==1.13.1
-          pip install -q manim aider-chat
+          python -m venv .venv
+          .venv/bin/pip install -q numpy==1.26.4 scipy==1.13.1
+          .venv/bin/pip install -q manim aider-chat
+
+      - name: Activate virtualenv
+        run: echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
 
       - name: Configure git
         run: |
