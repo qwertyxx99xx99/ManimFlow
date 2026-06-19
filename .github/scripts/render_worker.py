@@ -73,45 +73,36 @@ if MANIM_OUTPUT.exists():
     shutil.rmtree(MANIM_OUTPUT)
 MANIM_OUTPUT.mkdir(parents=True)
 
-(MANIM_OUTPUT / "plan.md").write_text(
-    f"# Animation Plan\n\n## Original request\n{PROMPT}\n\n## Scenes\n{plan}\n"
-)
-subprocess.run(["git", "init"], cwd=str(MANIM_OUTPUT), capture_output=True)
-subprocess.run(["git", "add", "plan.md"], cwd=str(MANIM_OUTPUT), capture_output=True)
-subprocess.run(["git", "commit", "-m", "init"], cwd=str(MANIM_OUTPUT), capture_output=True)
-
-# ── Aider ─────────────────────────────────────────────────────────────────────
-task = (
-    "Read plan.md and implement it as a Manim animation project.\n\n"
-    "Structure:\n"
-    "- Helper modules first (objects.py, helpers.py, etc.)\n"
-    "- scene.py last, defines AnimScene(Scene), imports from helpers\n\n"
-    "scene.py is tested with:\n"
-    "  python3 -m manim -pql --disable_caching scene.py AnimScene"
+task_text = (
+    f"Implement the following Manim animation plan as a working Python project.\n\n"
+    f"Plan:\n{plan}\n\n"
+    f"Requirements:\n"
+    f"- Create helper modules first (objects.py, helpers.py, etc.) with reusable classes/functions\n"
+    f"- Create scene.py last, defining AnimScene(Scene) that imports from helpers\n"
+    f"- Test with: python3 -m manim -pql --disable_caching scene.py AnimScene\n"
+    f"- Fix any errors until the command succeeds and produces an mp4\n"
+    f"- Use MathTex(r'...') for equations, Text() for plain labels\n"
+    f"- Arrow(start=..., end=...) — never left=/right= kwargs\n"
+    f"- Make it visually complete and polished\n"
+    f"Working directory: {MANIM_OUTPUT.resolve()}"
 )
 
-aider_env = {
+# ── OpenHands ─────────────────────────────────────────────────────────────────
+oh_env = {
     **os.environ,
-    "OPENAI_API_KEY": COPILOT_TOKEN,
-    "GIT_AUTHOR_NAME": "aider", "GIT_AUTHOR_EMAIL": "aider@ci",
-    "GIT_COMMITTER_NAME": "aider", "GIT_COMMITTER_EMAIL": "aider@ci",
+    "LLM_MODEL": f"openai/{COPILOT_MODEL}",
+    "LLM_API_KEY": COPILOT_TOKEN,
+    "LLM_BASE_URL": COPILOT_BASE,
 }
 
-print("\n=== Aider: coding + auto-fix loop ===", flush=True)
+print("\n=== OpenHands: autonomous coding loop ===", flush=True)
 r = subprocess.run(
-    ["aider",
-     "--model", f"openai/{COPILOT_MODEL}",
-     "--openai-api-base", COPILOT_BASE,
-     "--openai-api-key", COPILOT_TOKEN,
-     "--yes-always", "--no-auto-commits", "--no-pretty",
-     "--no-show-model-warnings", "--no-check-update",
-     "--test-cmd", "python3 -m manim -pql --disable_caching scene.py AnimScene 2>&1",
-     "--auto-test", "--message", task,
-     "plan.md"],
-    cwd=str(MANIM_OUTPUT), text=True, timeout=1800, env=aider_env,
+    ["openhands", "--headless", "--override-with-envs",
+     "--task", task_text],
+    text=True, timeout=1800, env=oh_env,
     stderr=subprocess.STDOUT,
 )
-print(f"aider exit: {r.returncode}", flush=True)
+print(f"openhands exit: {r.returncode}", flush=True)
 
 # ── Check output ──────────────────────────────────────────────────────────────
 videos = [v for v in MANIM_OUTPUT.rglob("*.mp4") if v.stat().st_size > 50_000]
