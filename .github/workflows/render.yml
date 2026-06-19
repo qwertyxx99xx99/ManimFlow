@@ -61,7 +61,7 @@ jobs:
         run: |
           python -m venv .venv
           .venv/bin/pip install -q numpy==1.26.4 scipy==1.13.1
-          .venv/bin/pip install -q manim openhands-ai
+          .venv/bin/pip install -q manim openhands
 
       - name: Activate virtualenv
         run: echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
