@@ -88,6 +88,10 @@ task_text = (
 )
 
 # ── OpenHands ─────────────────────────────────────────────────────────────────
+WORKSPACE = pathlib.Path(os.environ.get("GITHUB_WORKSPACE", pathlib.Path.cwd()))
+OH_PYTHON = WORKSPACE / ".venv-oh" / "bin" / "openhands"
+MANIM_PYTHON = WORKSPACE / ".venv-manim" / "bin" / "python3"
+
 oh_env = {
     **os.environ,
     "LLM_MODEL": f"openai/{COPILOT_MODEL}",
@@ -95,9 +99,15 @@ oh_env = {
     "LLM_BASE_URL": COPILOT_BASE,
 }
 
+# Update task to use the manim venv python explicitly
+task_text = task_text.replace(
+    "python3 -m manim",
+    f"{MANIM_PYTHON} -m manim"
+)
+
 print("\n=== OpenHands: autonomous coding loop ===", flush=True)
 r = subprocess.run(
-    [sys.executable, "-m", "openhands", "--headless", "--override-with-envs",
+    [str(OH_PYTHON), "--headless", "--override-with-envs",
      "--task", task_text],
     text=True, timeout=1800, env=oh_env,
     stderr=subprocess.STDOUT,
