@@ -117,9 +117,11 @@ docs_dir = pathlib.Path("manim_docs")
 if not docs_dir.exists():
     subprocess.run(["git", "clone", "--filter=blob:none", "--no-checkout", "--depth=1",
                     "https://github.com/ManimCommunity/manim.git", str(docs_dir)], check=True)
-    subprocess.run(["git", "sparse-checkout", "set", "docs/source/reference_index",
-                    "docs/source/tutorials"], cwd=str(docs_dir), check=True)
-    subprocess.run(["git", "checkout"], cwd=str(docs_dir), check=True)
+    subprocess.run(["git", "sparse-checkout", "init", "--cone"], cwd=str(docs_dir), check=True)
+    subprocess.run(["git", "sparse-checkout", "set",
+                    "docs/source/reference_index", "docs/source/tutorials"],
+                   cwd=str(docs_dir), check=True)
+    subprocess.run(["git", "checkout", "main"], cwd=str(docs_dir), check=True)
 
 doc_files = list(docs_dir.rglob("*.rst"))
 read_args = [arg for f in doc_files for arg in ["--read", str(f)]]
