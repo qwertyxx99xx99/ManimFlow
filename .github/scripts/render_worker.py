@@ -97,7 +97,7 @@ oh_env = {
 
 print("\n=== OpenHands: autonomous coding loop ===", flush=True)
 r = subprocess.run(
-    ["openhands", "--headless", "--override-with-envs",
+    [sys.executable, "-m", "openhands", "--headless", "--override-with-envs",
      "--task", task_text],
     text=True, timeout=1800, env=oh_env,
     stderr=subprocess.STDOUT,
