@@ -4,11 +4,12 @@ import sys, os, subprocess, pathlib, shutil, json, re, threading, urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
-PROMPT = os.environ["ISSUE_TITLE"]
+_title = os.environ["ISSUE_TITLE"]
+_body = os.environ.get("ISSUE_BODY", "").strip()
+PROMPT = f"{_title}\n\n{_body}" if _body else _title
 COMMENT_ID = os.environ["COMMENT_ID"]
 GH_TOKEN = os.environ["GH_TOKEN"]
 REPO = os.environ["REPO"]
-ISSUE_NUMBER = os.environ["ISSUE_NUMBER"]
 LOCAL_PORT = 18642
 MANIM_OUTPUT = pathlib.Path("manim_output")
 EXA_URL = "https://demos.exa.ai/chatbot-demo/api/chat/stream"
@@ -18,15 +19,17 @@ def update_comment(body):
     payload = json.dumps({"body": body}).encode()
     req = urllib.request.Request(
         f"https://api.github.com/repos/{REPO}/issues/comments/{COMMENT_ID}",
-        data=payload,
-        method="PATCH",
+        data=payload, method="PATCH",
         headers={
             "Authorization": f"Bearer {GH_TOKEN}",
             "Content-Type": "application/json",
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
-    urllib.request.urlopen(req, timeout=15)
+    try:
+        urllib.request.urlopen(req, timeout=15)
+    except Exception as e:
+        print(f"[warn] comment update failed: {e}", flush=True)
 
 
 def _strip(t):
@@ -43,8 +46,7 @@ def _exa(messages):
     user_content = (
         "IMPORTANT: use plain ``` for ALL code blocks, never ```python or ```bash.\n\n"
         + (sys_msg["content"] if sys_msg else "")
-        + "\n\n"
-        + last["content"]
+        + "\n\n" + last["content"]
     )
     payload = json.dumps({
         "message": user_content,
@@ -53,10 +55,8 @@ def _exa(messages):
         "model": "google/gemini-2.5-flash",
         "searchType": "instant",
     }).encode()
-    req = urllib.request.Request(
-        EXA_URL, data=payload,
-        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
-    )
+    req = urllib.request.Request(EXA_URL, data=payload,
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"})
     full = ""; evt = None
     with urllib.request.urlopen(req, timeout=180) as resp:
         buf = b""
@@ -104,13 +104,8 @@ srv = _TS(("127.0.0.1", LOCAL_PORT), _H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 print(f"LLM proxy on :{LOCAL_PORT}", flush=True)
 
-update_comment(
-    f"🎬 **Render started**\n\nPrompt: `{PROMPT}`\n\n"
-    "✅ Deps ready\n"
-    "✅ LLM proxy running\n"
-    "_Planning scenes..._"
-)
-
+# ── Plan ──────────────────────────────────────────────────────────────────────
+print("\n=== Planning ===", flush=True)
 payload = json.dumps({"model": "manimator", "messages": [
     {"role": "system", "content": (
         "You are a Manim animation planner. Output ONLY a numbered scene plan — "
@@ -122,8 +117,7 @@ payload = json.dumps({"model": "manimator", "messages": [
 ], "max_tokens": 2048}).encode()
 req = urllib.request.Request(
     f"http://127.0.0.1:{LOCAL_PORT}/v1/chat/completions",
-    data=payload,
-    headers={"Content-Type": "application/json", "Authorization": "Bearer dummy"},
+    data=payload, headers={"Content-Type": "application/json", "Authorization": "Bearer dummy"},
 )
 with urllib.request.urlopen(req, timeout=180) as resp:
     raw = json.loads(resp.read())["choices"][0]["message"]["content"].strip()
@@ -136,17 +130,18 @@ for marker in ["Would you like", "Do you want", "Should I", "Could you clarify",
         if idx >= 0:
             raw = raw[:idx]
 plan = raw.strip()
-print(f"\n=== Scene Plan ===\n{plan}\n{'='*40}", flush=True)
+scene_count = len([l for l in plan.splitlines() if re.match(r'^\d+\.', l.strip())])
+print(f"\n=== Scene Plan ({scene_count} scenes) ===\n{plan}\n{'='*40}", flush=True)
 
 update_comment(
-    f"🎬 **Render started**\n\nPrompt: `{PROMPT}`\n\n"
-    "✅ Deps ready\n"
-    "✅ LLM proxy running\n"
-    f"✅ Scene plan ({len(plan.splitlines())} scenes)\n"
-    "_Writing code & rendering..._\n\n"
+    f"🎬 **Render in progress**\n\nPrompt: `{PROMPT}`\n\n"
+    f"✅ Deps installed\n"
+    f"✅ Scene plan ({scene_count} scenes)\n"
+    f"_⏳ Writing code & rendering (this takes 10–20 min)..._\n\n"
     f"<details><summary>Scene plan</summary>\n\n```\n{plan}\n```\n</details>"
 )
 
+# ── Setup ─────────────────────────────────────────────────────────────────────
 if MANIM_OUTPUT.exists():
     shutil.rmtree(MANIM_OUTPUT)
 MANIM_OUTPUT.mkdir(parents=True)
@@ -180,6 +175,7 @@ task = (
     "- Make it visually complete and polished"
 )
 
+# ── Aider ─────────────────────────────────────────────────────────────────────
 print("\n=== Aider: coding + auto-fix loop ===", flush=True)
 r = subprocess.run(
     ["aider", "--model", "openai/manimator",
@@ -195,6 +191,7 @@ r = subprocess.run(
 )
 print(f"aider exit: {r.returncode}", flush=True)
 
+# ── Check output ──────────────────────────────────────────────────────────────
 videos = [v for v in MANIM_OUTPUT.rglob("*.mp4") if v.stat().st_size > 50_000]
 if not videos:
     print("FAILED: no valid video rendered", flush=True)

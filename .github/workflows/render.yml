@@ -1,16 +1,17 @@
 name: Render Manim Animation
 
-"on":
+on:
   issues:
     types: [labeled]
 
 jobs:
   render:
-    if: >
-      github.event.label.name == 'manim' &&
-      github.event.issue.user.login == 'theabbie'
+    if: github.event.label.name == 'manim' && github.event.issue.user.login == 'theabbie'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      issues: write
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -24,15 +25,16 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `🎬 **Render started**\n\nPrompt: \`${context.payload.issue.title}\`\n\n_Installing deps..._`,
+              body: `🎬 **Render started**\n\nPrompt: \`${context.payload.issue.title}\`\n\n_⏳ Installing deps..._`,
             });
-            core.setOutput('comment_id', comment.data.id);
+            core.setOutput('comment_id', String(comment.data.id));
 
       - name: Cache apt packages
         uses: actions/cache@v4
+        id: apt-cache
         with:
           path: /var/cache/apt/archives
-          key: apt-manim-${{ runner.os }}-v1
+          key: apt-manim-${{ runner.os }}-v2
 
       - name: Install system deps
         run: |
@@ -51,12 +53,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-manim-${{ runner.os }}-py311-v1
+          key: pip-manim-py311-v1
 
       - name: Install Python deps
         run: |
           pip install -q numpy==1.26.4 scipy==1.13.1
           pip install -q manim aider-chat
+
+      - name: Configure git
+        run: |
+          git config --global user.name "manimflow"
+          git config --global user.email "manimflow@ci"
 
       - name: Update comment — planning
         uses: actions/github-script@v7
@@ -66,13 +73,14 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               comment_id: ${{ steps.start-comment.outputs.comment_id }},
-              body: `🎬 **Render started**\n\nPrompt: \`${context.payload.issue.title}\`\n\n✅ Deps ready\n_Planning scenes..._`,
+              body: `🎬 **Render started**\n\nPrompt: \`${context.payload.issue.title}\`\n\n✅ Deps installed\n_⏳ Planning scenes..._`,
             });
 
       - name: Run render
         id: render
         env:
           ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
           COMMENT_ID: ${{ steps.start-comment.outputs.comment_id }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -94,12 +102,11 @@ jobs:
         with:
           script: |
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            const artifactUrl = `${runUrl}#artifacts`;
             await github.rest.issues.updateComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               comment_id: ${{ steps.start-comment.outputs.comment_id }},
-              body: `🎬 **Render complete!**\n\nPrompt: \`${context.payload.issue.title}\`\n\n✅ Deps ready\n✅ Scene plan generated\n✅ Code written & tested\n✅ Video rendered\n\n📥 [Download animation.mp4](${artifactUrl})\n\n_Artifact available for 30 days._`,
+              body: `🎬 **Render complete!**\n\nPrompt: \`${context.payload.issue.title}\`\n\n✅ Deps installed\n✅ Scene plan generated\n✅ Code written & auto-tested\n✅ Video rendered\n\n📥 [Download animation.mp4](${runUrl}#artifacts)\n\n_Artifact available for 30 days._`,
             });
 
       - name: Post failure comment
@@ -112,5 +119,5 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               comment_id: ${{ steps.start-comment.outputs.comment_id }},
-              body: `🎬 **Render failed**\n\nPrompt: \`${context.payload.issue.title}\`\n\n❌ See [workflow logs](${runUrl}) for details.`,
+              body: `❌ **Render failed**\n\nPrompt: \`${context.payload.issue.title}\`\n\n[View logs](${runUrl})`,
             });
