@@ -47,28 +47,24 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
 
-      - name: Cache virtualenvs
+      - name: Cache virtualenv
         id: venv-cache
         uses: actions/cache@v4
         with:
-          path: |
-            .venv-manim
-            .venv-oh
-          key: venv-split-py312-v2
+          path: .venv
+          key: venv-manim-py311-v3
 
       - name: Install Python deps
         if: steps.venv-cache.outputs.cache-hit != 'true'
         run: |
-          python -m venv .venv-manim
-          .venv-manim/bin/pip install -q numpy==1.26.4 scipy==1.13.1
-          .venv-manim/bin/pip install -q manim
-          python -m venv .venv-oh
-          .venv-oh/bin/pip install -q "lmnr==0.7.52" openhands
+          python -m venv .venv
+          .venv/bin/pip install -q numpy==1.26.4 scipy==1.13.1
+          .venv/bin/pip install -q manim aider-chat
 
-      - name: Activate manim virtualenv
-        run: echo "$GITHUB_WORKSPACE/.venv-manim/bin" >> $GITHUB_PATH
+      - name: Activate virtualenv
+        run: echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
 
       - name: Configure git
         run: |
