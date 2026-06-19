@@ -56,7 +56,7 @@ jobs:
           path: |
             .venv-manim
             .venv-oh
-          key: venv-split-py312-v1
+          key: venv-split-py312-v2
 
       - name: Install Python deps
         if: steps.venv-cache.outputs.cache-hit != 'true'
@@ -65,7 +65,7 @@ jobs:
           .venv-manim/bin/pip install -q numpy==1.26.4 scipy==1.13.1
           .venv-manim/bin/pip install -q manim
           python -m venv .venv-oh
-          .venv-oh/bin/pip install -q openhands
+          .venv-oh/bin/pip install -q "lmnr==0.7.52" openhands
 
       - name: Activate manim virtualenv
         run: echo "$GITHUB_WORKSPACE/.venv-manim/bin" >> $GITHUB_PATH
