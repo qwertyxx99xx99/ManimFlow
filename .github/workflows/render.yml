@@ -1,0 +1,116 @@
+name: Render Manim Animation
+
+"on":
+  issues:
+    types: [labeled]
+
+jobs:
+  render:
+    if: >
+      github.event.label.name == 'manim' &&
+      github.event.issue.user.login == 'theabbie'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Post start comment
+        uses: actions/github-script@v7
+        id: start-comment
+        with:
+          script: |
+            const comment = await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `🎬 **Render started**\n\nPrompt: \`${context.payload.issue.title}\`\n\n_Installing deps..._`,
+            });
+            core.setOutput('comment_id', comment.data.id);
+
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-manim-${{ runner.os }}-v1
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -q \
+            libcairo2-dev libpango1.0-dev ffmpeg \
+            texlive-latex-base texlive-latex-extra \
+            texlive-fonts-recommended texlive-plain-generic dvisvgm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-manim-${{ runner.os }}-py311-v1
+
+      - name: Install Python deps
+        run: |
+          pip install -q numpy==1.26.4 scipy==1.13.1
+          pip install -q manim aider-chat
+
+      - name: Update comment — planning
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: ${{ steps.start-comment.outputs.comment_id }},
+              body: `🎬 **Render started**\n\nPrompt: \`${context.payload.issue.title}\`\n\n✅ Deps ready\n_Planning scenes..._`,
+            });
+
+      - name: Run render
+        id: render
+        env:
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          COMMENT_ID: ${{ steps.start-comment.outputs.comment_id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: python .github/scripts/render_worker.py
+
+      - name: Upload video artifact
+        if: success()
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: animation-${{ github.event.issue.number }}
+          path: animation.mp4
+          retention-days: 30
+
+      - name: Post success comment
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const artifactUrl = `${runUrl}#artifacts`;
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: ${{ steps.start-comment.outputs.comment_id }},
+              body: `🎬 **Render complete!**\n\nPrompt: \`${context.payload.issue.title}\`\n\n✅ Deps ready\n✅ Scene plan generated\n✅ Code written & tested\n✅ Video rendered\n\n📥 [Download animation.mp4](${artifactUrl})\n\n_Artifact available for 30 days._`,
+            });
+
+      - name: Post failure comment
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: ${{ steps.start-comment.outputs.comment_id }},
+              body: `🎬 **Render failed**\n\nPrompt: \`${context.payload.issue.title}\`\n\n❌ See [workflow logs](${runUrl}) for details.`,
+            });
