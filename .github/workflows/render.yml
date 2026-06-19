@@ -38,10 +38,11 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -q \
+          sudo apt-get install -y -qq \
             libcairo2-dev libpango1.0-dev ffmpeg \
             texlive-latex-base texlive-latex-extra \
-            texlive-fonts-recommended texlive-plain-generic dvisvgm
+            texlive-fonts-recommended texlive-plain-generic dvisvgm \
+            2>&1 | tail -5
 
       - name: Set up Python
         uses: actions/setup-python@v5
