@@ -2,7 +2,6 @@
 
 import sys, os, subprocess, pathlib, shutil, json, re, urllib.request
 
-
 PROMPT_TITLE = os.environ["ISSUE_TITLE"]
 PROMPT_BODY = os.environ.get("ISSUE_BODY", "").strip()
 PROMPT = f"{PROMPT_TITLE}\n\n{PROMPT_BODY}" if PROMPT_BODY else PROMPT_TITLE
@@ -11,7 +10,6 @@ GH_TOKEN = os.environ["GH_TOKEN"]
 COPILOT_TOKEN = os.environ["COPILOT_TOKEN"]
 REPO = os.environ["REPO"]
 MANIM_OUTPUT = pathlib.Path("manim_output")
-
 COPILOT_BASE = "https://api.individual.githubcopilot.com"
 COPILOT_MODEL = "gemini-2.5-pro"
 COPILOT_HEADERS = {
@@ -39,33 +37,26 @@ def update_comment(body):
         print(f"[warn] comment update failed: {e}", flush=True)
 
 
-def copilot_chat(messages, max_tokens=2048):
-    payload = json.dumps({
-        "model": COPILOT_MODEL,
-        "messages": messages,
-        "max_tokens": max_tokens,
-    }).encode()
-    req = urllib.request.Request(
-        f"{COPILOT_BASE}/chat/completions",
-        data=payload, headers=COPILOT_HEADERS,
-    )
+def copilot_chat(messages):
+    payload = json.dumps({"model": COPILOT_MODEL, "messages": messages}).encode()
+    req = urllib.request.Request(f"{COPILOT_BASE}/chat/completions",
+        data=payload, headers=COPILOT_HEADERS)
     with urllib.request.urlopen(req, timeout=180) as resp:
         return json.loads(resp.read())["choices"][0]["message"]["content"].strip()
 
 
 # ── Plan ──────────────────────────────────────────────────────────────────────
 print("\n=== Planning ===", flush=True)
-raw = copilot_chat([
+plan = copilot_chat([
     {"role": "system", "content": (
-        "You are a Manim animation planner. Output ONLY a numbered scene plan — "
-        "no questions, no clarifications, no preamble, no code blocks. "
-        "Scale scenes: short→3-4, default→5-6, long/detailed→8-12. "
-        "Plain English per scene: shapes/colors, motion, equations/labels. Never ask anything."
+        "You are a Manim animation planner. Output a plain numbered list of scenes. "
+        "Each scene: one short line with the visual idea only, no formatting, no markdown, no bold, no bullets. "
+        "Scale count to length: short->3-4, default->5-6, detailed->8-12. "
+        "No preamble, no closing remarks."
     )},
     {"role": "user", "content": PROMPT},
 ])
 
-plan = raw
 scene_count = len([l for l in plan.splitlines() if re.match(r'^\d+\.', l.strip())])
 print(f"\n=== Scene Plan ({scene_count} scenes) ===\n{plan}\n{'='*40}", flush=True)
 
@@ -73,7 +64,7 @@ update_comment(
     f"🎬 **Render in progress**\n\nPrompt: `{PROMPT_TITLE}`\n\n"
     f"✅ Deps installed\n"
     f"✅ Scene plan ({scene_count} scenes)\n"
-    f"_⏳ Writing code & rendering (10–20 min)..._\n\n"
+    f"_⏳ Writing code & rendering (10-20 min)..._\n\n"
     f"<details><summary>Scene plan</summary>\n\n```\n{plan}\n```\n</details>"
 )
 
@@ -89,29 +80,7 @@ subprocess.run(["git", "init"], cwd=str(MANIM_OUTPUT), capture_output=True)
 subprocess.run(["git", "add", "plan.md"], cwd=str(MANIM_OUTPUT), capture_output=True)
 subprocess.run(["git", "commit", "-m", "init"], cwd=str(MANIM_OUTPUT), capture_output=True)
 
-# ── Aider ─────────────────────────────────────────────────────────────────────
-task = (
-    "Read plan.md and implement the animation as a Manim project.\n\n"
-    "Write files in this order:\n"
-    "1. All helper modules first (objects.py, helpers.py, etc.) with all reusable classes/functions\n"
-    "2. scene.py last — imports from helpers, defines AnimScene(Scene) with construct()\n\n"
-    "Do not leave any file empty. scene.py runs with:\n"
-    "  python3 -m manim -pql --disable_caching scene.py AnimScene\n\n"
-    "Rules:\n"
-    "- AnimScene(Scene) in scene.py\n"
-    "- MathTex(r'...') for all equations and math symbols\n"
-    "- Text() only for plain prose labels\n"
-    "- Arrow(start=..., end=...) — never left=/right= kwargs\n"
-    "- Make it visually complete and polished"
-)
-
-aider_env = {
-    **os.environ,
-    "OPENAI_API_KEY": COPILOT_TOKEN,
-    "GIT_AUTHOR_NAME": "aider", "GIT_AUTHOR_EMAIL": "aider@ci",
-    "GIT_COMMITTER_NAME": "aider", "GIT_COMMITTER_EMAIL": "aider@ci",
-}
-
+# ── Fetch Manim docs ──────────────────────────────────────────────────────────
 print("\n=== Fetching Manim docs ===", flush=True)
 docs_dir = pathlib.Path("manim_docs")
 if not docs_dir.exists():
@@ -124,7 +93,26 @@ if not docs_dir.exists():
     subprocess.run(["git", "checkout", "main"], cwd=str(docs_dir), check=True)
 
 doc_files = list(docs_dir.rglob("*.rst"))
-read_args = [arg for f in doc_files for arg in ["--read", str(f)]]
+read_args = [arg for f in doc_files for arg in ["--read", str(f.resolve())]]
+print(f"Loaded {len(doc_files)} doc files", flush=True)
+
+# ── Aider ─────────────────────────────────────────────────────────────────────
+task = (
+    "Read plan.md and implement it as a Manim animation project.\n\n"
+    "Consult the provided Manim docs (--read files) for correct API usage.\n\n"
+    "Structure:\n"
+    "- Helper modules first (objects.py, helpers.py, etc.)\n"
+    "- scene.py last, defines AnimScene(Scene), imports from helpers\n\n"
+    "scene.py is tested with:\n"
+    "  python3 -m manim -pql --disable_caching scene.py AnimScene"
+)
+
+aider_env = {
+    **os.environ,
+    "OPENAI_API_KEY": COPILOT_TOKEN,
+    "GIT_AUTHOR_NAME": "aider", "GIT_AUTHOR_EMAIL": "aider@ci",
+    "GIT_COMMITTER_NAME": "aider", "GIT_COMMITTER_EMAIL": "aider@ci",
+}
 
 print("\n=== Aider: coding + auto-fix loop ===", flush=True)
 r = subprocess.run(
