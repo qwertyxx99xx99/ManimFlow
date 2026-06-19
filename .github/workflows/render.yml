@@ -82,6 +82,7 @@ jobs:
           ISSUE_BODY: ${{ github.event.issue.body }}
           COMMENT_ID: ${{ steps.start-comment.outputs.comment_id }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COPILOT_TOKEN: ${{ secrets.COPILOT_TOKEN }}
           REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: python .github/scripts/render_worker.py

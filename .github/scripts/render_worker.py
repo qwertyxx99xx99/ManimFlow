@@ -2,18 +2,20 @@
 
 import sys, os, subprocess, pathlib, shutil, json, re, urllib.request
 
+
 PROMPT_TITLE = os.environ["ISSUE_TITLE"]
 PROMPT_BODY = os.environ.get("ISSUE_BODY", "").strip()
 PROMPT = f"{PROMPT_TITLE}\n\n{PROMPT_BODY}" if PROMPT_BODY else PROMPT_TITLE
 COMMENT_ID = os.environ["COMMENT_ID"]
 GH_TOKEN = os.environ["GH_TOKEN"]
+COPILOT_TOKEN = os.environ["COPILOT_TOKEN"]
 REPO = os.environ["REPO"]
 MANIM_OUTPUT = pathlib.Path("manim_output")
 
 COPILOT_BASE = "https://api.individual.githubcopilot.com"
 COPILOT_MODEL = "gemini-2.5-pro"
 COPILOT_HEADERS = {
-    "Authorization": f"Bearer {GH_TOKEN}",
+    "Authorization": f"Bearer {COPILOT_TOKEN}",
     "Content-Type": "application/json",
     "Editor-Version": "vscode/1.85.0",
     "Copilot-Integration-Id": "vscode-chat",
@@ -63,14 +65,7 @@ raw = copilot_chat([
     {"role": "user", "content": PROMPT},
 ])
 
-raw = re.sub(r"```.*?```", "", raw, flags=re.DOTALL).strip()
-for marker in ["Would you like", "Do you want", "Should I", "Could you clarify",
-               "Can you provide", "What specific", "How long", "Any specific", "Let me know"]:
-    for sep in ("\n\n", "\n"):
-        idx = raw.find(sep + marker)
-        if idx >= 0:
-            raw = raw[:idx]
-plan = raw.strip()
+plan = raw
 scene_count = len([l for l in plan.splitlines() if re.match(r'^\d+\.', l.strip())])
 print(f"\n=== Scene Plan ({scene_count} scenes) ===\n{plan}\n{'='*40}", flush=True)
 
@@ -112,7 +107,7 @@ task = (
 
 aider_env = {
     **os.environ,
-    "OPENAI_API_KEY": GH_TOKEN,
+    "OPENAI_API_KEY": COPILOT_TOKEN,
     "GIT_AUTHOR_NAME": "aider", "GIT_AUTHOR_EMAIL": "aider@ci",
     "GIT_COMMITTER_NAME": "aider", "GIT_COMMITTER_EMAIL": "aider@ci",
 }
@@ -122,7 +117,7 @@ r = subprocess.run(
     ["aider",
      "--model", f"openai/{COPILOT_MODEL}",
      "--openai-api-base", COPILOT_BASE,
-     "--openai-api-key", GH_TOKEN,
+     "--openai-api-key", COPILOT_TOKEN,
      "--yes-always", "--no-auto-commits", "--no-pretty",
      "--no-show-model-warnings", "--no-check-update",
      "--test-cmd", "python3 -m manim -pql --disable_caching scene.py AnimScene 2>&1",
