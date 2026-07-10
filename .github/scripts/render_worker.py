@@ -17,6 +17,7 @@ COPILOT_HEADERS = {
     "Content-Type": "application/json",
     "Editor-Version": "vscode/1.85.0",
     "Copilot-Integration-Id": "vscode-chat",
+    "Openai-Intent": "conversation-completions",
 }
 
 
@@ -87,7 +88,14 @@ task = (
     "- Helper modules first (objects.py, helpers.py, etc.)\n"
     "- scene.py last, defines AnimScene(Scene), imports from helpers\n\n"
     "scene.py is tested with:\n"
-    "  python3 -m manim -pql --disable_caching scene.py AnimScene"
+    "  python3 -m manim -pql --disable_caching scene.py AnimScene\n\n"
+    "Rules:\n"
+    "- Every file must start with: from manim import *\n"
+    "- AnimScene(Scene) in scene.py\n"
+    "- MathTex(r'...') for all equations\n"
+    "- Text() for plain labels\n"
+    "- Arrow(start=..., end=...) only\n"
+    "- Never use bare names like UP, DOWN, LEFT, RIGHT, ORIGIN without 'from manim import *'"
 )
 
 aider_env = {
@@ -105,7 +113,7 @@ r = subprocess.run(
      "--openai-api-key", COPILOT_TOKEN,
      "--yes-always", "--no-auto-commits", "--no-pretty",
      "--no-show-model-warnings", "--no-check-update",
-     "--test-cmd", "python3 -m manim -pql --disable_caching scene.py AnimScene 2>&1",
+     "--test-cmd", f"{sys.executable} -m manim -pql --disable_caching scene.py AnimScene 2>&1",
      "--auto-test", "--message", task,
      "plan.md"],
     cwd=str(MANIM_OUTPUT), text=True, timeout=1800, env=aider_env,
