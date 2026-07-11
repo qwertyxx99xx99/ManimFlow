@@ -250,16 +250,50 @@ def concise_pi_event(line):
     # partial message. Parsing or rendering them can freeze a Streamlit session.
     if line.startswith('{"type":"message_update"'):
         return None
+    if line.startswith('{"type":"agent_start"'):
+        return "Pi is analyzing the plan."
+    if line.startswith('{"type":"agent_end"'):
+        return "Pi finished its work."
     try:
         event = json.loads(line)
     except json.JSONDecodeError:
         return line[:1000]
 
     event_type = event.get("type")
-    if event_type == "agent_start":
-        return "Pi agent started."
-    if event_type == "agent_end":
-        return "Pi agent finished."
+    if event_type == "tool_execution_start":
+        name = event.get("toolName", "tool")
+        arguments = event.get("args") or {}
+        if name in {"write", "edit", "read"}:
+            detail = arguments.get("path", "")
+        elif name == "bash":
+            detail = arguments.get("command", "")
+        else:
+            detail = json.dumps(arguments)
+        detail = str(detail).replace("\n", " ")[:500]
+        labels = {
+            "write": "Writing file",
+            "edit": "Editing file",
+            "read": "Reading file",
+            "bash": "Running command",
+        }
+        return f"{labels.get(name, f'Running {name}')} → {detail}".rstrip()
+    if event_type == "tool_execution_end":
+        name = event.get("toolName", "tool")
+        result = event.get("result")
+        result_text = ""
+        if isinstance(result, dict):
+            parts = result.get("content", [])
+            if isinstance(parts, list):
+                result_text = "\n".join(
+                    str(part.get("text", ""))
+                    for part in parts
+                    if isinstance(part, dict) and part.get("text")
+                )
+        if not result_text and result is not None:
+            result_text = str(result)
+        status = "failed" if event.get("isError") else "completed"
+        result_text = result_text.strip()[:1500]
+        return f"{name} {status}" + (f":\n{result_text}" if result_text else "")
     if event_type != "message_end":
         return None
 
@@ -272,22 +306,10 @@ def concise_pi_event(line):
     updates = []
     for block in content:
         block_type = block.get("type")
-        if block_type == "toolCall":
-            name = block.get("name", "tool")
-            arguments = block.get("arguments") or {}
-            if name in {"write", "edit", "read"}:
-                detail = arguments.get("path", "")
-            elif name == "bash":
-                detail = arguments.get("command", "")
-            else:
-                detail = ""
-            detail = str(detail).replace("\n", " ")[:300]
-            updates.append(f"Pi → {name}: {detail}".rstrip())
-        elif block_type == "text" and role in {"assistant", "toolResult"}:
+        if block_type == "text" and role == "assistant":
             text = str(block.get("text", "")).strip()
             if text:
-                prefix = "Result" if role == "toolResult" else "Pi"
-                updates.append(f"{prefix}: {text[:1000]}")
+                updates.append(f"Pi: {text[:1500]}")
     return "\n".join(updates) or None
 
 
@@ -373,8 +395,6 @@ def run_render(token, user_prompt, log_queue):
 
         reader = threading.Thread(target=read_pi_output, daemon=True)
         reader.start()
-        started_at = time.monotonic()
-        last_heartbeat = started_at
         while reader.is_alive() or not raw_lines.empty():
             try:
                 output_line = raw_lines.get(timeout=1)
@@ -384,11 +404,6 @@ def run_render(token, user_prompt, log_queue):
                 update = concise_pi_event(output_line)
                 if update:
                     log_queue.put(("log", update))
-            now = time.monotonic()
-            if now - last_heartbeat >= 15:
-                elapsed = int(now - started_at)
-                log_queue.put(("log", f"Pi is still working... ({elapsed}s elapsed)"))
-                last_heartbeat = now
         reader.join(timeout=1)
         return_code = process.wait()
         log_queue.put(("log", f"Pi exit code: {return_code}"))
