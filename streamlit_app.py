@@ -2,6 +2,7 @@ import json
 import os
 import pathlib
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -274,8 +275,8 @@ def write_project_files(workspace, user_prompt, plan):
         "MANDATORY DOCUMENTATION GATE — complete this before writing any Python:\n"
         "1. Identify every Manim class, animation, object, layout helper, and renderer feature you plan to use.\n"
         "2. Search the local manim-docs/ tree with command-line tools such as rg and find. Do not use the web.\n"
-        "3. Read the relevant local documentation for every planned part.\n"
-        "4. Create docs_consulted.md before any .py file. For each planned API, record the exact manim-docs/ path read and the key constraint or usage learned.\n"
+        "3. Use Pi's read tool (not only grep/cat) to read the relevant local documentation for every planned part. Read at least three distinct relevant documentation files.\n"
+        "4. Create docs_consulted.md before any .py file. For each planned API, record the exact manim-docs/ path actually read and the key constraint or usage learned. Cite no file you did not read with the read tool.\n"
         "Do not start implementation until docs_consulted.md is complete.\n"
         "Create helper modules first and scene.py last.\n"
         "Every Python file must start with: from manim import *\n"
@@ -298,16 +299,71 @@ def newest_video(workspace):
     return max(videos, key=lambda path: path.stat().st_mtime) if videos else None
 
 
-def validate_documentation_gate(workspace):
+def canonical_doc_path(value, workspace):
+    normalized = str(value).replace("\\", "/")
+    marker = "manim-docs/"
+    if marker not in normalized:
+        return None
+    relative = marker + normalized.split(marker, 1)[1]
+    relative = relative.rstrip(".,;:)]}`'").replace("//", "/")
+    candidate = workspace / relative
+    try:
+        if candidate.is_file() and candidate.resolve().is_relative_to(MANIM_DOCS_REPO.resolve()):
+            return relative
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def observe_documentation_read(line, workspace, observed_reads):
+    if '"type":"tool_execution_start"' not in line or '"toolName":"read"' not in line:
+        return
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    if event.get("type") != "tool_execution_start" or event.get("toolName") != "read":
+        return
+    path = (event.get("args") or {}).get("path", "")
+    canonical = canonical_doc_path(path, workspace)
+    if canonical:
+        observed_reads.add(canonical)
+
+
+def validate_documentation_gate(workspace, observed_reads):
     evidence = workspace / "docs_consulted.md"
     if not evidence.is_file() or evidence.stat().st_size < 200:
         raise RuntimeError(
             "Pi skipped the documentation gate: docs_consulted.md is missing or incomplete."
         )
     content = evidence.read_text(errors="replace")
-    if "manim-docs/" not in content:
+    cited_values = re.findall(r"manim-docs/[A-Za-z0-9_./-]+", content)
+    if not cited_values:
         raise RuntimeError(
             "Pi's docs_consulted.md does not cite exact paths from the local Manim docs."
+        )
+    cited_paths = set()
+    missing_paths = []
+    for value in cited_values:
+        canonical = canonical_doc_path(value, workspace)
+        if canonical:
+            cited_paths.add(canonical)
+        else:
+            missing_paths.append(value.rstrip(".,;:"))
+    if missing_paths:
+        raise RuntimeError(
+            "Pi cited documentation paths that do not exist: "
+            + ", ".join(sorted(set(missing_paths)))
+        )
+    if len(cited_paths) < 3:
+        raise RuntimeError(
+            f"Pi consulted only {len(cited_paths)} distinct documentation file(s); at least 3 are required."
+        )
+    unread_citations = cited_paths - observed_reads
+    if unread_citations:
+        raise RuntimeError(
+            "Pi cited documentation it did not actually open with the read tool: "
+            + ", ".join(sorted(unread_citations))
         )
     python_files = list(workspace.glob("*.py"))
     if python_files and evidence.stat().st_mtime > min(path.stat().st_mtime for path in python_files):
@@ -529,6 +585,7 @@ def run_render(token, user_prompt, log_queue):
         reader = threading.Thread(target=read_pi_output, daemon=True)
         reader.start()
         output_started = False
+        observed_doc_reads = set()
         launched_at = time.monotonic()
         while reader.is_alive() or not raw_lines.empty():
             try:
@@ -537,6 +594,7 @@ def run_render(token, user_prompt, log_queue):
                 output_line = None
             if output_line is not None:
                 output_started = True
+                observe_documentation_read(output_line, workspace, observed_doc_reads)
                 update = concise_pi_event(output_line)
                 if update:
                     log_queue.put(("log", update))
@@ -549,7 +607,10 @@ def run_render(token, user_prompt, log_queue):
         return_code = process.wait()
         log_queue.put(("log", f"Pi exit code: {return_code}"))
 
-        validate_documentation_gate(workspace)
+        validate_documentation_gate(workspace, observed_doc_reads)
+        log_queue.put(
+            ("log", f"Documentation gate passed → {len(observed_doc_reads)} distinct files read")
+        )
         video = newest_video(workspace)
         if video is None:
             raise RuntimeError("Pi did not produce a valid MP4 render.")
