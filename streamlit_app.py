@@ -44,6 +44,7 @@ GITHUB_CLIENT_ID = "8b76dd0df855d8bc7db1"
 COPILOT_BASE = "https://api.individual.githubcopilot.com"
 COPILOT_MODEL = os.environ.get("COPILOT_MODEL", "gpt-4o")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 EXA_ENDPOINT = os.environ.get(
     "EXA_ENDPOINT", "https://demos.exa.ai/chatbot-demo/api/chat/stream"
 )
@@ -56,6 +57,7 @@ _browser_storage = components.declare_component(
 )
 PI_PROVIDER = "manimflow-copilot"
 PI_TOKEN_ENV = "MANIMFLOW_COPILOT_TOKEN"
+ANTHROPIC_TOKEN_ENV = "ANTHROPIC_OAUTH_TOKEN"
 
 def request_device_code():
     data = urllib.parse.urlencode(
@@ -289,6 +291,62 @@ def gemini_chat(api_key, messages, log_queue=None):
     raise RuntimeError("Gemini planner exhausted its retry attempts.")
 
 
+def anthropic_chat(access_token, messages, log_queue=None):
+    system_text = "\n".join(
+        message["content"] for message in messages if message["role"] == "system"
+    )
+    conversation = [
+        {"role": message["role"], "content": message["content"]}
+        for message in messages
+        if message["role"] in {"user", "assistant"}
+    ]
+    payload = json.dumps(
+        {
+            "model": ANTHROPIC_MODEL,
+            "max_tokens": 4096,
+            "system": system_text,
+            "messages": conversation,
+        }
+    ).encode()
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+        "anthropic-dangerous-direct-browser-access": "true",
+        "User-Agent": "claude-cli/2.1.0",
+        "x-app": "cli",
+    }
+    for attempt in range(4):
+        request = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=180) as response:
+                body = json.loads(response.read())
+            text = "".join(
+                block.get("text", "")
+                for block in body.get("content", [])
+                if block.get("type") == "text"
+            ).strip()
+            if not text:
+                raise RuntimeError("Anthropic returned no planner text.")
+            return text
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 or attempt == 3:
+                detail = exc.read().decode("utf-8", errors="replace")[:500]
+                raise RuntimeError(f"Anthropic HTTP {exc.code}: {detail}") from exc
+            delay = min(10 * (2**attempt), 60)
+            if log_queue:
+                log_queue.put(
+                    ("log", f"Anthropic rate limited the planner; retrying in {delay}s...")
+                )
+            time.sleep(delay)
+    raise RuntimeError("Anthropic planner exhausted its retry attempts.")
+
+
 def messages_to_exa_prompt(messages):
     return "\n\n".join(
         [
@@ -416,6 +474,8 @@ def suggest_youtube_metadata(provider, credential, user_prompt):
     ]
     if provider == "gemini":
         response = gemini_chat(credential, messages)
+    elif provider == "anthropic":
+        response = anthropic_chat(credential, messages)
     elif provider == "exa":
         response = exa_chat(messages)
     else:
@@ -866,6 +926,7 @@ def _run_render(provider, credential, user_prompt, log_queue):
     workspace.mkdir()
     provider_display = {
         "gemini": "Gemini",
+        "anthropic": "Anthropic",
         "exa": "Exa",
         "copilot": "Copilot",
     }[provider]
@@ -896,6 +957,10 @@ def _run_render(provider, credential, user_prompt, log_queue):
             plan = gemini_chat(credential, planner_messages, log_queue)
             pi_provider = "google"
             pi_model = GEMINI_MODEL
+        elif provider == "anthropic":
+            plan = anthropic_chat(credential, planner_messages, log_queue)
+            pi_provider = "anthropic"
+            pi_model = ANTHROPIC_MODEL
         elif provider == "exa":
             plan = exa_chat(planner_messages, log_queue)
             pi_provider = "exa-direct"
@@ -912,6 +977,8 @@ def _run_render(provider, credential, user_prompt, log_queue):
         env = os.environ.copy()
         if provider == "gemini":
             env["GEMINI_API_KEY"] = credential
+        elif provider == "anthropic":
+            env[ANTHROPIC_TOKEN_ENV] = credential
         elif provider == "copilot":
             env[PI_TOKEN_ENV] = credential
         env["PI_CODING_AGENT_DIR"] = str(agent_dir)
@@ -989,7 +1056,7 @@ def _run_render(provider, credential, user_prompt, log_queue):
             "--model",
             pi_model,
             "--thinking",
-            "medium" if provider == "gemini" else "off",
+            "medium" if provider in {"gemini", "anthropic"} else "off",
             "@plan.md",
         ]
         if provider != "exa":
@@ -1169,12 +1236,13 @@ if youtube_ready and stored_youtube_credential:
 
 provider_label = st.radio(
     "Model provider",
-    ["GitHub Copilot", "Google Gemini", "Exa"],
+    ["GitHub Copilot", "Google Gemini", "Anthropic OAuth Token", "Exa"],
     horizontal=True,
 )
 selected_provider = {
     "GitHub Copilot": "copilot",
     "Google Gemini": "gemini",
+    "Anthropic OAuth Token": "anthropic",
     "Exa": "exa",
 }[provider_label]
 
@@ -1187,6 +1255,17 @@ if "device_flow" not in st.session_state:
     st.session_state.device_flow = None
 
 gemini_key = secret_value("GEMINI_API_KEY")
+anthropic_token = ""
+if selected_provider == "anthropic":
+    anthropic_token = st.text_input(
+        "Anthropic OAuth access token",
+        type="password",
+        placeholder="sk-ant-oat...",
+        help=(
+            "Paste the short-lived access token from your Anthropic OAuth credential. "
+            "It remains only in this browser session and is not saved by ManimFlow."
+        ),
+    ).strip()
 
 if selected_provider == "gemini" and not gemini_key:
     st.error(
@@ -1194,6 +1273,10 @@ if selected_provider == "gemini" and not gemini_key:
         "Streamlit App settings → Secrets before generating."
     )
     st.code('GEMINI_API_KEY = "your-key"', language="toml")
+    st.stop()
+
+if selected_provider == "anthropic" and not anthropic_token:
+    st.info("Paste an Anthropic OAuth access token to use Claude for this render.")
     st.stop()
 
 if selected_provider == "copilot" and not st.session_state.copilot_token:
@@ -1234,6 +1317,10 @@ with st.sidebar:
         st.success("Connected to Google Gemini")
         st.caption(f"Agent: Pi · Model: {GEMINI_MODEL}")
         st.caption("Using GEMINI_API_KEY from Streamlit Secrets.")
+    elif selected_provider == "anthropic":
+        st.success("Connected to Anthropic OAuth")
+        st.caption(f"Agent: Pi · Model: {ANTHROPIC_MODEL}")
+        st.caption("The pasted access token is session-only and is not persisted.")
     elif selected_provider == "exa":
         st.success("Connected to Exa")
         st.caption(f"Agent: Pi · Model: {EXA_MODEL}")
@@ -1283,6 +1370,8 @@ if generate and prompt.strip():
     credential = (
         gemini_key
         if selected_provider == "gemini"
+        else anthropic_token
+        if selected_provider == "anthropic"
         else st.session_state.copilot_token
         if selected_provider == "copilot"
         else None
