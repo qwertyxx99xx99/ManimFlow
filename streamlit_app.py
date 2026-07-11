@@ -105,18 +105,23 @@ def resolve_pi_command(log_queue):
     configured = os.environ.get("PI_COMMAND", "").strip()
     if configured:
         return configured
-    if LOCAL_PI.exists():
+    system_node = shutil.which("node")
+    if LOCAL_PI.exists() and system_node and node_major(system_node) >= 22:
         return str(LOCAL_PI)
     installed = shutil.which("pi")
-    if installed and node_major(shutil.which("node") or "node") >= 22:
+    if installed and system_node and node_major(system_node) >= 22:
         return installed
 
     runtime_pi = RUNTIME_DIR / "node_modules" / ".bin" / "pi"
-    if runtime_pi.exists():
+    isolated_node = NODE_DIR / "bin" / "node"
+    runtime_node = str(isolated_node) if isolated_node.exists() else system_node
+    if runtime_pi.exists() and runtime_node and node_major(runtime_node) >= 22:
         return str(runtime_pi)
 
     with _PI_INSTALL_LOCK:
-        if runtime_pi.exists():
+        isolated_node = NODE_DIR / "bin" / "node"
+        runtime_node = str(isolated_node) if isolated_node.exists() else shutil.which("node")
+        if runtime_pi.exists() and runtime_node and node_major(runtime_node) >= 22:
             return str(runtime_pi)
 
         node = shutil.which("node")
@@ -351,6 +356,48 @@ def run_render(token, user_prompt, log_queue):
         if (NODE_DIR / "bin" / "node").exists():
             env["PATH"] = f"{NODE_DIR / 'bin'}:{env.get('PATH', '')}"
 
+        log_queue.put(("log", f"Pi executable → {pi_command}"))
+        try:
+            pi_version = subprocess.run(
+                [pi_command, "--version"],
+                cwd=str(workspace),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=True,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Pi preflight timed out while checking its version.") from exc
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()
+            raise RuntimeError(f"Pi version preflight failed: {detail}") from exc
+        log_queue.put(("log", f"Pi version → {pi_version.stdout.strip()}"))
+
+        try:
+            model_check = subprocess.run(
+                [pi_command, "--list-models", PI_PROVIDER],
+                cwd=str(workspace),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Pi preflight timed out while loading the Copilot model.") from exc
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()
+            raise RuntimeError(f"Pi model preflight failed: {detail}") from exc
+        if COPILOT_MODEL not in model_check.stdout:
+            raise RuntimeError(
+                f"Pi cannot see {PI_PROVIDER}/{COPILOT_MODEL}. Output: "
+                f"{model_check.stdout.strip() or '(empty)'}"
+            )
+        log_queue.put(("log", f"Pi model ready → {PI_PROVIDER}/{COPILOT_MODEL}"))
+
         task = (
             "Implement the complete animation described in plan.md. Use your file and "
             "bash tools autonomously. Run the Manim test after edits, diagnose failures, "
@@ -360,6 +407,7 @@ def run_render(token, user_prompt, log_queue):
             pi_command,
             "--mode",
             "json",
+            "--verbose",
             "--approve",
             "--no-session",
             "--no-extensions",
@@ -374,16 +422,18 @@ def run_render(token, user_prompt, log_queue):
             task,
         ]
 
-        log_queue.put(("log", "Running Pi (this may take 10-20 minutes)..."))
+        log_queue.put(("log", "Starting Pi agent process..."))
         process = subprocess.Popen(
             command,
             cwd=str(workspace),
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
             text=False,
             bufsize=0,
         )
+        log_queue.put(("log", f"Pi process started → PID {process.pid}"))
         if process.stdout is None:
             raise RuntimeError("Pi output stream is unavailable.")
 
@@ -398,13 +448,21 @@ def run_render(token, user_prompt, log_queue):
 
         reader = threading.Thread(target=read_pi_output, daemon=True)
         reader.start()
+        output_started = False
+        launched_at = time.monotonic()
         while reader.is_alive() or not raw_lines.empty():
             try:
                 output_line = raw_lines.get(timeout=1)
             except queue.Empty:
                 output_line = None
             if output_line is not None:
+                output_started = True
                 log_queue.put(("log", output_line))
+            elif not output_started and time.monotonic() - launched_at >= 60:
+                process.terminate()
+                raise RuntimeError(
+                    "Pi passed version/model preflight but emitted zero agent output for 60 seconds."
+                )
         reader.join(timeout=1)
         return_code = process.wait()
         log_queue.put(("log", f"Pi exit code: {return_code}"))
