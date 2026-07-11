@@ -939,7 +939,7 @@ def clean_old_runs(max_age_seconds=6 * 60 * 60):
             pass
 
 
-def concise_pi_event(line):
+def concise_pi_event(line, tool_details=None):
     line = line.strip()
     if not line:
         return None
@@ -975,6 +975,11 @@ def concise_pi_event(line):
             detail = arguments.get("command", "")
         else:
             detail = json.dumps(arguments)
+        if tool_details is not None and event.get("toolCallId"):
+            tool_details[event["toolCallId"]] = {
+                "name": name,
+                "detail": str(detail),
+            }
         detail = str(detail).replace("\n", " ")[:500]
         labels = {
             "write": "Writing file",
@@ -985,6 +990,9 @@ def concise_pi_event(line):
         return f"{labels.get(name, f'Running {name}')} → {detail}".rstrip()
     if event_type == "tool_execution_end":
         name = event.get("toolName", "tool")
+        tool_detail = {}
+        if tool_details is not None and event.get("toolCallId"):
+            tool_detail = tool_details.pop(event["toolCallId"], {})
         result = event.get("result")
         result_text = ""
         if isinstance(result, dict):
@@ -998,7 +1006,14 @@ def concise_pi_event(line):
         if not result_text and result is not None:
             result_text = str(result)
         status = "failed" if event.get("isError") else "completed"
-        result_text = result_text.strip()[:1500]
+        result_text = result_text.strip()
+        is_plan_read = (
+            name == "read"
+            and tool_detail.get("name") == "read"
+            and pathlib.PurePath(tool_detail.get("detail", "")).name == "plan.md"
+        )
+        if not is_plan_read:
+            result_text = result_text[:1500]
         return f"{name} {status}" + (f":\n{result_text}" if result_text else "")
     if event_type != "message_end":
         return None
@@ -1184,6 +1199,7 @@ def _run_render(provider, credential, user_prompt, log_queue):
         if provider != "exa":
             command_prefix.insert(7, "--no-extensions")
         observed_doc_reads = set()
+        pi_tool_details = {}
         video = None
         max_attempts = 4
         for attempt in range(1, max_attempts + 1):
@@ -1224,7 +1240,7 @@ def _run_render(provider, credential, user_prompt, log_queue):
                         rate_limited = True
                     if provider != "exa":
                         observe_documentation_read(output_line, workspace, observed_doc_reads)
-                    update = concise_pi_event(output_line)
+                    update = concise_pi_event(output_line, pi_tool_details)
                     if update:
                         log_queue.put(("log", update))
                 elif not output_started and time.monotonic() - launched_at >= 60:
