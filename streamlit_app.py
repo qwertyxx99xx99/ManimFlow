@@ -430,8 +430,8 @@ def run_render(token, user_prompt, log_queue):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            text=False,
-            bufsize=0,
+            text=True,
+            bufsize=1,
         )
         log_queue.put(("log", f"Pi process started → PID {process.pid}"))
         if process.stdout is None:
@@ -440,11 +440,8 @@ def run_render(token, user_prompt, log_queue):
         raw_lines = queue.Queue()
 
         def read_pi_output():
-            while True:
-                chunk = os.read(process.stdout.fileno(), 4096)
-                if not chunk:
-                    break
-                raw_lines.put(chunk.decode("utf-8", errors="replace"))
+            for output_line in process.stdout:
+                raw_lines.put(output_line)
 
         reader = threading.Thread(target=read_pi_output, daemon=True)
         reader.start()
@@ -457,7 +454,9 @@ def run_render(token, user_prompt, log_queue):
                 output_line = None
             if output_line is not None:
                 output_started = True
-                log_queue.put(("log", output_line))
+                update = concise_pi_event(output_line)
+                if update:
+                    log_queue.put(("log", update))
             elif not output_started and time.monotonic() - launched_at >= 60:
                 process.terminate()
                 raise RuntimeError(
