@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 
 import streamlit as st
@@ -26,6 +27,7 @@ _PI_INSTALL_LOCK = threading.Lock()
 MANIM_DOCS_REPO = pathlib.Path("/tmp/manim_community_docs")
 MANIM_DOCS_URL = "https://github.com/ManimCommunity/manim.git"
 _MANIM_DOCS_LOCK = threading.Lock()
+_RENDER_SEMAPHORE = threading.Semaphore(1)
 
 GITHUB_CLIENT_ID = "8b76dd0df855d8bc7db1"
 COPILOT_BASE = "https://api.individual.githubcopilot.com"
@@ -83,16 +85,33 @@ def copilot_headers(token):
     }
 
 
-def copilot_chat(token, messages):
+def copilot_chat(token, messages, log_queue=None):
     payload = json.dumps({"model": COPILOT_MODEL, "messages": messages}).encode()
-    req = urllib.request.Request(
-        f"{COPILOT_BASE}/chat/completions",
-        data=payload,
-        headers=copilot_headers(token),
-    )
-    with urllib.request.urlopen(req, timeout=180) as response:
-        body = json.loads(response.read())
-    return body["choices"][0]["message"]["content"].strip()
+    for attempt in range(5):
+        req = urllib.request.Request(
+            f"{COPILOT_BASE}/chat/completions",
+            data=payload,
+            headers=copilot_headers(token),
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=180) as response:
+                body = json.loads(response.read())
+            return body["choices"][0]["message"]["content"].strip()
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 or attempt == 4:
+                raise
+            retry_after = exc.headers.get("Retry-After", "")
+            try:
+                delay = max(int(retry_after), 5 * (2**attempt))
+            except ValueError:
+                delay = 5 * (2**attempt)
+            delay = min(delay, 120)
+            if log_queue:
+                log_queue.put(
+                    ("log", f"Copilot rate limited the planner; retrying in {delay}s...")
+                )
+            time.sleep(delay)
+    raise RuntimeError("Copilot planner exhausted its retry attempts.")
 
 
 def node_major(node_command):
@@ -453,7 +472,7 @@ def concise_pi_event(line):
     return "\n".join(updates) or None
 
 
-def run_render(token, user_prompt, log_queue):
+def _run_render(token, user_prompt, log_queue):
     clean_old_runs()
     run_dir = pathlib.Path(tempfile.mkdtemp(prefix="run-", dir=BASE))
     workspace = run_dir / "project"
@@ -479,6 +498,7 @@ def run_render(token, user_prompt, log_queue):
                 },
                 {"role": "user", "content": user_prompt},
             ],
+            log_queue,
         )
         log_queue.put(("plan", plan))
 
@@ -587,6 +607,7 @@ def run_render(token, user_prompt, log_queue):
             reader = threading.Thread(target=read_pi_output, daemon=True)
             reader.start()
             output_started = False
+            rate_limited = False
             launched_at = time.monotonic()
             while reader.is_alive() or not raw_lines.empty():
                 try:
@@ -595,6 +616,9 @@ def run_render(token, user_prompt, log_queue):
                     output_line = None
                 if output_line is not None:
                     output_started = True
+                    lowered_output = output_line.lower()
+                    if "429" in lowered_output or "too many requests" in lowered_output:
+                        rate_limited = True
                     observe_documentation_read(output_line, workspace, observed_doc_reads)
                     update = concise_pi_event(output_line)
                     if update:
@@ -615,6 +639,12 @@ def run_render(token, user_prompt, log_queue):
             missing_scene = not (workspace / "scene.py").is_file()
             state = "scene.py is missing" if missing_scene else "scene.py exists but no valid MP4 was rendered"
             if attempt < max_attempts:
+                if rate_limited:
+                    delay = min(30 * attempt, 120)
+                    log_queue.put(
+                        ("log", f"Copilot rate limited Pi; waiting {delay}s before continuation...")
+                    )
+                    time.sleep(delay)
                 log_queue.put(
                     ("log", f"Attempt {attempt} was incomplete ({state}); continuing autonomously...")
                 )
@@ -639,6 +669,19 @@ def run_render(token, user_prompt, log_queue):
         log_queue.put(("done", str(destination)))
     except Exception as exc:
         log_queue.put(("error", str(exc)))
+
+
+def run_render(token, user_prompt, log_queue):
+    if not _RENDER_SEMAPHORE.acquire(blocking=False):
+        log_queue.put(
+            ("log", "Another animation is currently rendering; this request is queued.")
+        )
+        _RENDER_SEMAPHORE.acquire()
+        log_queue.put(("log", "Render slot available; starting this request."))
+    try:
+        _run_render(token, user_prompt, log_queue)
+    finally:
+        _RENDER_SEMAPHORE.release()
 
 
 st.set_page_config(page_title="ManimFlow", layout="wide")
