@@ -143,6 +143,7 @@ def youtube_oauth_flow(config, state=None):
         },
         scopes=[YOUTUBE_SCOPE],
         state=state,
+        autogenerate_code_verifier=False,
     )
     flow.redirect_uri = config["redirect_uri"]
     return flow
