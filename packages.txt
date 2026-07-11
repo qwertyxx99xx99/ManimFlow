@@ -12,6 +12,7 @@ texlive-latex-base
 texlive-latex-extra
 texlive-fonts-recommended
 texlive-plain-generic
+texlive-science
 dvisvgm
 nodejs
 npm

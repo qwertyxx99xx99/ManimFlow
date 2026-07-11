@@ -873,7 +873,8 @@ def write_project_files(workspace, user_prompt, plan, require_docs=True):
         + "Create helper modules first and scene.py last.\n"
         "Every Python file must start with: from manim import *\n"
         "scene.py must define AnimScene(Scene).\n"
-        "Use MathTex(r'...') for equations and Text() for plain labels.\n"
+        "A full LaTeX toolchain is installed and available. Use MathTex for equations, variables, units, operators, and all mathematical notation. Use Tex for mixed LaTeX prose and mathematics, and Text only for ordinary non-mathematical labels.\n"
+        "Do not replace mathematical notation with Text to avoid LaTeX. If TeX compilation fails, diagnose and repair the expression or template, then render again.\n"
         "Use Arrow(start=..., end=...) for arrows.\n"
         "Keep every object inside the camera frame and avoid overlaps.\n"
         "Repeatedly run this test and repair every error:\n"
@@ -1116,7 +1117,9 @@ def _run_render(provider, credential, user_prompt, log_queue):
                 "content": (
                     "You are a Manim animation planner. Output a plain numbered "
                     "list of visual scenes with no markdown or commentary. Use 3-4 "
-                    "scenes for a short request, 5-6 by default, and 8-12 when detailed."
+                    "scenes for a short request, 5-6 by default, and 8-12 when detailed. "
+                    "When the topic is mathematical or scientific, plan properly typeset "
+                    "LaTeX equations, symbols, and derivations wherever they improve the explanation."
                 ),
             },
             {"role": "user", "content": user_prompt},
