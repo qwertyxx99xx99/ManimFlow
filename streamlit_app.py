@@ -45,6 +45,7 @@ COPILOT_BASE = "https://api.individual.githubcopilot.com"
 COPILOT_MODEL = os.environ.get("COPILOT_MODEL", "gpt-4o")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")
+CHATGPT_MODEL = os.environ.get("CHATGPT_MODEL", "gpt-5.4")
 EXA_ENDPOINT = os.environ.get(
     "EXA_ENDPOINT", "https://demos.exa.ai/chatbot-demo/api/chat/stream"
 )
@@ -58,6 +59,7 @@ _browser_storage = components.declare_component(
 PI_PROVIDER = "manimflow-copilot"
 PI_TOKEN_ENV = "MANIMFLOW_COPILOT_TOKEN"
 ANTHROPIC_TOKEN_ENV = "ANTHROPIC_OAUTH_TOKEN"
+CHATGPT_TOKEN_ENV = "MANIMFLOW_CHATGPT_OAUTH_TOKEN"
 
 def request_device_code():
     data = urllib.parse.urlencode(
@@ -347,6 +349,94 @@ def anthropic_chat(access_token, messages, log_queue=None):
     raise RuntimeError("Anthropic planner exhausted its retry attempts.")
 
 
+def jwt_payload(token):
+    try:
+        encoded = token.split(".")[1]
+        encoded += "=" * (-len(encoded) % 4)
+        return json.loads(base64.urlsafe_b64decode(encoded))
+    except (IndexError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("The ChatGPT OAuth access token is not a valid JWT.") from exc
+
+
+def chatgpt_account_id(access_token):
+    account_id = jwt_payload(access_token).get("https://api.openai.com/auth", {}).get(
+        "chatgpt_account_id"
+    )
+    if not account_id:
+        raise RuntimeError("The ChatGPT OAuth token does not contain an account ID.")
+    return account_id
+
+
+def chatgpt_codex_chat(access_token, messages, log_queue=None):
+    system_text = "\n".join(
+        message["content"] for message in messages if message["role"] == "system"
+    )
+    inputs = [
+        {
+            "role": message["role"],
+            "content": [{"type": "input_text", "text": message["content"]}],
+        }
+        for message in messages
+        if message["role"] in {"user", "assistant"}
+    ]
+    payload = json.dumps(
+        {
+            "model": CHATGPT_MODEL,
+            "store": False,
+            "stream": True,
+            "instructions": system_text or "You are a helpful assistant.",
+            "input": inputs,
+            "text": {"verbosity": "low"},
+            "include": ["reasoning.encrypted_content"],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "reasoning": {"effort": "low", "summary": "auto"},
+        }
+    ).encode()
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "chatgpt-account-id": chatgpt_account_id(access_token),
+        "originator": "pi",
+        "User-Agent": "pi (streamlit; cloud)",
+        "OpenAI-Beta": "responses=experimental",
+        "Accept": "text/event-stream",
+        "Content-Type": "application/json",
+    }
+    for attempt in range(4):
+        request = urllib.request.Request(
+            "https://chatgpt.com/backend-api/codex/responses",
+            data=payload,
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=180) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+            text = ""
+            for line in raw.splitlines():
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    event = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "response.output_text.delta":
+                    text += event.get("delta", "")
+            if not text.strip():
+                raise RuntimeError("ChatGPT Codex returned no planner text.")
+            return text.strip()
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 or attempt == 3:
+                detail = exc.read().decode("utf-8", errors="replace")[:500]
+                raise RuntimeError(f"ChatGPT Codex HTTP {exc.code}: {detail}") from exc
+            delay = min(10 * (2**attempt), 60)
+            if log_queue:
+                log_queue.put(
+                    ("log", f"ChatGPT Codex rate limited the planner; retrying in {delay}s...")
+                )
+            time.sleep(delay)
+    raise RuntimeError("ChatGPT Codex planner exhausted its retry attempts.")
+
+
 def messages_to_exa_prompt(messages):
     return "\n\n".join(
         [
@@ -474,6 +564,8 @@ def suggest_youtube_metadata(provider, credential, user_prompt):
     ]
     if provider == "gemini":
         response = gemini_chat(credential, messages)
+    elif provider == "chatgpt":
+        response = chatgpt_codex_chat(credential, messages)
     elif provider == "anthropic":
         response = anthropic_chat(credential, messages)
     elif provider == "exa":
@@ -624,6 +716,29 @@ def write_pi_config(agent_dir, provider):
             }
         }
     }
+    if provider == "chatgpt":
+        models["providers"]["openai-codex"] = {
+            "baseUrl": "https://chatgpt.com/backend-api",
+            "api": "openai-codex-responses",
+            "apiKey": f"${CHATGPT_TOKEN_ENV}",
+            "models": [
+                {
+                    "id": CHATGPT_MODEL,
+                    "name": f"ChatGPT Codex {CHATGPT_MODEL}",
+                    "reasoning": True,
+                    "thinkingLevelMap": {"minimal": "low", "xhigh": "xhigh"},
+                    "input": ["text", "image"],
+                    "contextWindow": 272000,
+                    "maxTokens": 128000,
+                    "cost": {
+                        "input": 0,
+                        "output": 0,
+                        "cacheRead": 0,
+                        "cacheWrite": 0,
+                    },
+                }
+            ],
+        }
     (agent_dir / "models.json").write_text(json.dumps(models, indent=2))
     (agent_dir / "settings.json").write_text(
         json.dumps({"telemetry": False, "quietStartup": True}, indent=2)
@@ -926,6 +1041,7 @@ def _run_render(provider, credential, user_prompt, log_queue):
     workspace.mkdir()
     provider_display = {
         "gemini": "Gemini",
+        "chatgpt": "ChatGPT Codex",
         "anthropic": "Anthropic",
         "exa": "Exa",
         "copilot": "Copilot",
@@ -957,6 +1073,10 @@ def _run_render(provider, credential, user_prompt, log_queue):
             plan = gemini_chat(credential, planner_messages, log_queue)
             pi_provider = "google"
             pi_model = GEMINI_MODEL
+        elif provider == "chatgpt":
+            plan = chatgpt_codex_chat(credential, planner_messages, log_queue)
+            pi_provider = "openai-codex"
+            pi_model = CHATGPT_MODEL
         elif provider == "anthropic":
             plan = anthropic_chat(credential, planner_messages, log_queue)
             pi_provider = "anthropic"
@@ -977,6 +1097,8 @@ def _run_render(provider, credential, user_prompt, log_queue):
         env = os.environ.copy()
         if provider == "gemini":
             env["GEMINI_API_KEY"] = credential
+        elif provider == "chatgpt":
+            env[CHATGPT_TOKEN_ENV] = credential
         elif provider == "anthropic":
             env[ANTHROPIC_TOKEN_ENV] = credential
         elif provider == "copilot":
@@ -1056,7 +1178,7 @@ def _run_render(provider, credential, user_prompt, log_queue):
             "--model",
             pi_model,
             "--thinking",
-            "medium" if provider in {"gemini", "anthropic"} else "off",
+            "medium" if provider in {"gemini", "chatgpt", "anthropic"} else "off",
             "@plan.md",
         ]
         if provider != "exa":
@@ -1236,12 +1358,19 @@ if youtube_ready and stored_youtube_credential:
 
 provider_label = st.radio(
     "Model provider",
-    ["GitHub Copilot", "Google Gemini", "Anthropic OAuth Token", "Exa"],
+    [
+        "GitHub Copilot",
+        "Google Gemini",
+        "ChatGPT OAuth Token",
+        "Anthropic OAuth Token",
+        "Exa",
+    ],
     horizontal=True,
 )
 selected_provider = {
     "GitHub Copilot": "copilot",
     "Google Gemini": "gemini",
+    "ChatGPT OAuth Token": "chatgpt",
     "Anthropic OAuth Token": "anthropic",
     "Exa": "exa",
 }[provider_label]
@@ -1255,6 +1384,16 @@ if "device_flow" not in st.session_state:
     st.session_state.device_flow = None
 
 gemini_key = secret_value("GEMINI_API_KEY")
+chatgpt_token = ""
+if selected_provider == "chatgpt":
+    chatgpt_token = st.text_input(
+        "ChatGPT OAuth access token",
+        type="password",
+        help=(
+            "Paste the short-lived ChatGPT/Codex OAuth access token. It remains only "
+            "in this browser session and is not saved by ManimFlow."
+        ),
+    ).strip()
 anthropic_token = ""
 if selected_provider == "anthropic":
     anthropic_token = st.text_input(
@@ -1277,6 +1416,10 @@ if selected_provider == "gemini" and not gemini_key:
 
 if selected_provider == "anthropic" and not anthropic_token:
     st.info("Paste an Anthropic OAuth access token to use Claude for this render.")
+    st.stop()
+
+if selected_provider == "chatgpt" and not chatgpt_token:
+    st.info("Paste a ChatGPT OAuth access token to use Codex for this render.")
     st.stop()
 
 if selected_provider == "copilot" and not st.session_state.copilot_token:
@@ -1317,6 +1460,10 @@ with st.sidebar:
         st.success("Connected to Google Gemini")
         st.caption(f"Agent: Pi · Model: {GEMINI_MODEL}")
         st.caption("Using GEMINI_API_KEY from Streamlit Secrets.")
+    elif selected_provider == "chatgpt":
+        st.success("Connected to ChatGPT OAuth")
+        st.caption(f"Agent: Pi · Model: {CHATGPT_MODEL}")
+        st.caption("The pasted access token is session-only and is not persisted.")
     elif selected_provider == "anthropic":
         st.success("Connected to Anthropic OAuth")
         st.caption(f"Agent: Pi · Model: {ANTHROPIC_MODEL}")
@@ -1370,6 +1517,8 @@ if generate and prompt.strip():
     credential = (
         gemini_key
         if selected_provider == "gemini"
+        else chatgpt_token
+        if selected_provider == "chatgpt"
         else anthropic_token
         if selected_provider == "anthropic"
         else st.session_state.copilot_token
