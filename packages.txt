@@ -13,3 +13,5 @@ texlive-latex-extra
 texlive-fonts-recommended
 texlive-plain-generic
 dvisvgm
+nodejs
+npm

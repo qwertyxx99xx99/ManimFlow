@@ -1,240 +1,431 @@
+import json
+import os
+import pathlib
+import queue
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+
 import streamlit as st
-import subprocess, pathlib, shutil, os, json, re, threading, queue, time, sys
-import urllib.request, urllib.parse
+
 
 BASE = pathlib.Path("/tmp/manimflow_workspace")
 BASE.mkdir(parents=True, exist_ok=True)
-MANIM_OUTPUT = BASE / "manim_output"
+APP_DIR = pathlib.Path(__file__).resolve().parent
+LOCAL_PI = APP_DIR / "node_modules" / ".bin" / "pi"
+RUNTIME_DIR = pathlib.Path("/tmp/manimflow_pi_runtime")
+NODE_DIR = pathlib.Path("/tmp/manimflow_node")
+PI_VERSION = "0.80.6"
+_PI_INSTALL_LOCK = threading.Lock()
 
 GITHUB_CLIENT_ID = "8b76dd0df855d8bc7db1"
 COPILOT_BASE = "https://api.individual.githubcopilot.com"
-COPILOT_MODEL = "gpt-4o"
-COPILOT_HEADERS = lambda token: {
-    "Authorization": f"Bearer {token}",
-    "Content-Type": "application/json",
-    "Editor-Version": "vscode/1.85.0",
-    "Copilot-Integration-Id": "vscode-chat",
-    "Openai-Intent": "conversation-completions",
-}
-
-WAKELOCK_JS = """
-<script>
-(function() {
-  let lock = null;
-  async function acquire() {
-    try { lock = await navigator.wakeLock.request('screen'); } catch(e) {}
-  }
-  acquire();
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') acquire();
-  });
-})();
-</script>
-"""
-
-# ── GitHub device flow ────────────────────────────────────────────────────────
+COPILOT_MODEL = os.environ.get("COPILOT_MODEL", "gpt-4o")
+PI_PROVIDER = "manimflow-copilot"
+PI_TOKEN_ENV = "MANIMFLOW_COPILOT_TOKEN"
 
 def request_device_code():
-    data = urllib.parse.urlencode({"client_id": GITHUB_CLIENT_ID, "scope": "read:user"}).encode()
-    req = urllib.request.Request("https://github.com/login/device/code", data=data,
-        headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read())
+    data = urllib.parse.urlencode(
+        {"client_id": GITHUB_CLIENT_ID, "scope": "read:user"}
+    ).encode()
+    req = urllib.request.Request(
+        "https://github.com/login/device/code",
+        data=data,
+        headers={"Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as response:
+        return json.loads(response.read())
+
+
+def deployment_token():
+    try:
+        value = st.secrets.get("COPILOT_TOKEN", "")
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    return os.environ.get("COPILOT_TOKEN", "").strip()
+
 
 def poll_token(device_code):
-    data = urllib.parse.urlencode({
-        "client_id": GITHUB_CLIENT_ID,
-        "device_code": device_code,
-        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-    }).encode()
-    req = urllib.request.Request("https://github.com/login/oauth/access_token", data=data,
-        headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read())
+    data = urllib.parse.urlencode(
+        {
+            "client_id": GITHUB_CLIENT_ID,
+            "device_code": device_code,
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        }
+    ).encode()
+    req = urllib.request.Request(
+        "https://github.com/login/oauth/access_token",
+        data=data,
+        headers={"Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as response:
+        return json.loads(response.read())
 
-# ── Copilot chat ──────────────────────────────────────────────────────────────
+
+def copilot_headers(token):
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Editor-Version": "vscode/1.85.0",
+        "Copilot-Integration-Id": "vscode-chat",
+        "Openai-Intent": "conversation-completions",
+    }
+
 
 def copilot_chat(token, messages):
     payload = json.dumps({"model": COPILOT_MODEL, "messages": messages}).encode()
-    req = urllib.request.Request(f"{COPILOT_BASE}/chat/completions",
-        data=payload, headers=COPILOT_HEADERS(token))
-    with urllib.request.urlopen(req, timeout=180) as resp:
-        return json.loads(resp.read())["choices"][0]["message"]["content"].strip()
+    req = urllib.request.Request(
+        f"{COPILOT_BASE}/chat/completions",
+        data=payload,
+        headers=copilot_headers(token),
+    )
+    with urllib.request.urlopen(req, timeout=180) as response:
+        body = json.loads(response.read())
+    return body["choices"][0]["message"]["content"].strip()
 
-# ── Render pipeline ───────────────────────────────────────────────────────────
+
+def node_major(node_command):
+    try:
+        version = subprocess.check_output(
+            [node_command, "--version"], text=True, timeout=10
+        ).strip()
+        return int(version.removeprefix("v").split(".", 1)[0])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
+
+
+def resolve_pi_command(log_queue):
+    configured = os.environ.get("PI_COMMAND", "").strip()
+    if configured:
+        return configured
+    if LOCAL_PI.exists():
+        return str(LOCAL_PI)
+    installed = shutil.which("pi")
+    if installed and node_major(shutil.which("node") or "node") >= 22:
+        return installed
+
+    runtime_pi = RUNTIME_DIR / "node_modules" / ".bin" / "pi"
+    if runtime_pi.exists():
+        return str(runtime_pi)
+
+    with _PI_INSTALL_LOCK:
+        if runtime_pi.exists():
+            return str(runtime_pi)
+
+        node = shutil.which("node")
+        npm = shutil.which("npm")
+        if not node or node_major(node) < 22 or not npm:
+            log_queue.put(("log", "Installing an isolated Node 22 runtime..."))
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "nodeenv",
+                    "--node=22.19.0",
+                    "--prebuilt",
+                    str(NODE_DIR),
+                ],
+                check=True,
+                timeout=300,
+            )
+            node = str(NODE_DIR / "bin" / "node")
+            npm = str(NODE_DIR / "bin" / "npm")
+
+        log_queue.put(("log", f"Installing Pi {PI_VERSION}..."))
+        install_env = os.environ.copy()
+        install_env["PATH"] = f"{pathlib.Path(node).parent}:{install_env.get('PATH', '')}"
+        subprocess.run(
+            [
+                npm,
+                "install",
+                "--prefix",
+                str(RUNTIME_DIR),
+                "--no-audit",
+                "--no-fund",
+                f"@earendil-works/pi-coding-agent@{PI_VERSION}",
+            ],
+            check=True,
+            env=install_env,
+            timeout=300,
+        )
+        if not runtime_pi.exists():
+            raise RuntimeError("Pi installation completed but its executable was not found.")
+        return str(runtime_pi)
+
+
+def write_pi_config(agent_dir):
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    models = {
+        "providers": {
+            PI_PROVIDER: {
+                "baseUrl": COPILOT_BASE,
+                "api": "openai-completions",
+                "apiKey": f"${PI_TOKEN_ENV}",
+                "authHeader": True,
+                "headers": {
+                    "Editor-Version": "vscode/1.85.0",
+                    "Copilot-Integration-Id": "vscode-chat",
+                    "Openai-Intent": "conversation-completions",
+                },
+                "compat": {
+                    "supportsDeveloperRole": False,
+                    "supportsReasoningEffort": False,
+                },
+                "models": [
+                    {
+                        "id": COPILOT_MODEL,
+                        "name": f"GitHub Copilot {COPILOT_MODEL}",
+                        "reasoning": False,
+                        "input": ["text"],
+                        "contextWindow": 128000,
+                        "maxTokens": 16384,
+                        "cost": {
+                            "input": 0,
+                            "output": 0,
+                            "cacheRead": 0,
+                            "cacheWrite": 0,
+                        },
+                    }
+                ],
+            }
+        }
+    }
+    (agent_dir / "models.json").write_text(json.dumps(models, indent=2))
+    (agent_dir / "settings.json").write_text(
+        json.dumps({"telemetry": False, "quietStartup": True}, indent=2)
+    )
+
+
+def write_project_files(workspace, user_prompt, plan):
+    render_command = f'"{sys.executable}" -m manim -pql --disable_caching scene.py AnimScene'
+    (workspace / "plan.md").write_text(
+        f"# Animation Plan\n\n## Original request\n{user_prompt}\n\n## Scenes\n{plan}\n"
+    )
+    (workspace / "AGENTS.md").write_text(
+        "You are an autonomous coding agent building a Manim animation.\n"
+        "Read plan.md before editing. Work without asking questions.\n"
+        "Create helper modules first and scene.py last.\n"
+        "Every Python file must start with: from manim import *\n"
+        "scene.py must define AnimScene(Scene).\n"
+        "Use MathTex(r'...') for equations and Text() for plain labels.\n"
+        "Use Arrow(start=..., end=...) for arrows.\n"
+        "Keep every object inside the camera frame and avoid overlaps.\n"
+        "Repeatedly run this test and repair every error:\n"
+        f"{render_command}\n"
+        "Stop only after the command succeeds and produces an MP4.\n"
+    )
+
+
+def newest_video(workspace):
+    videos = [
+        path
+        for path in workspace.rglob("*.mp4")
+        if path.is_file() and path.stat().st_size > 50_000
+    ]
+    return max(videos, key=lambda path: path.stat().st_mtime) if videos else None
+
+
+def clean_old_runs(max_age_seconds=6 * 60 * 60):
+    cutoff = time.time() - max_age_seconds
+    for path in BASE.glob("run-*"):
+        try:
+            if path.is_dir() and path.stat().st_mtime < cutoff:
+                shutil.rmtree(path)
+        except OSError:
+            pass
+
 
 def run_render(token, user_prompt, log_queue):
+    clean_old_runs()
+    run_dir = pathlib.Path(tempfile.mkdtemp(prefix="run-", dir=BASE))
+    workspace = run_dir / "project"
+    agent_dir = run_dir / "pi-agent"
+    workspace.mkdir()
+
     try:
-        log_queue.put(('log', 'Planning scenes...'))
-        plan = copilot_chat(token, [
-            {"role": "system", "content": (
-                "You are a Manim animation planner. Output a plain numbered list of scenes. "
-                "Each scene: one short line with the visual idea only, no formatting, no markdown, no bold, no bullets. "
-                "Scale count to length: short->3-4, default->5-6, detailed->8-12. "
-                "No preamble, no closing remarks."
-            )},
-            {"role": "user", "content": user_prompt},
-        ])
-        log_queue.put(('plan', plan))
+        pi_command = resolve_pi_command(log_queue)
 
-        if MANIM_OUTPUT.exists():
-            shutil.rmtree(MANIM_OUTPUT)
-        MANIM_OUTPUT.mkdir(parents=True)
-
-        (MANIM_OUTPUT / 'plan.md').write_text(
-            f"# Animation Plan\n\n## Original request\n{user_prompt}\n\n## Scenes\n{plan}\n"
+        log_queue.put(("log", "Planning scenes..."))
+        plan = copilot_chat(
+            token,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a Manim animation planner. Output a plain numbered "
+                        "list of visual scenes with no markdown or commentary. Use 3-4 "
+                        "scenes for a short request, 5-6 by default, and 8-12 when detailed."
+                    ),
+                },
+                {"role": "user", "content": user_prompt},
+            ],
         )
-        subprocess.run(['git', 'init'], cwd=str(MANIM_OUTPUT), capture_output=True)
-        subprocess.run(['git', 'add', 'plan.md'], cwd=str(MANIM_OUTPUT), capture_output=True)
-        subprocess.run(['git', 'commit', '-m', 'init'], cwd=str(MANIM_OUTPUT), capture_output=True)
+        log_queue.put(("plan", plan))
+
+        write_project_files(workspace, user_prompt, plan)
+        write_pi_config(agent_dir)
+
+        env = os.environ.copy()
+        env[PI_TOKEN_ENV] = token
+        env["PI_CODING_AGENT_DIR"] = str(agent_dir)
+        env["PI_TELEMETRY"] = "0"
+        env["PATH"] = f"{pathlib.Path(sys.executable).parent}:{env.get('PATH', '')}"
+        if (NODE_DIR / "bin" / "node").exists():
+            env["PATH"] = f"{NODE_DIR / 'bin'}:{env.get('PATH', '')}"
 
         task = (
-            "Read plan.md and implement it as a Manim animation project.\n\n"
-            "Structure:\n"
-            "- Helper modules first (objects.py, helpers.py, etc.)\n"
-            "- scene.py last, defines AnimScene(Scene), imports from helpers\n\n"
-            "scene.py is tested with:\n"
-            "  python3 -m manim -pql --disable_caching scene.py AnimScene\n\n"
-            "Rules:\n"
-            "- Every file must start with: from manim import *\n"
-            "- AnimScene(Scene) in scene.py\n"
-            "- MathTex(r'...') for all equations\n"
-            "- Text() for plain labels\n"
-            "- Arrow(start=..., end=...) only\n"
-            "- Never use bare names like UP, DOWN, LEFT, RIGHT, ORIGIN without 'from manim import *'\n"
-            "- Make it visually complete and polished"
+            "Implement the complete animation described in plan.md. Use your file and "
+            "bash tools autonomously. Run the Manim test after edits, diagnose failures, "
+            "and keep repairing until it renders successfully. Do not ask questions."
         )
+        command = [
+            pi_command,
+            "--mode",
+            "json",
+            "--approve",
+            "--no-session",
+            "--no-extensions",
+            "--no-skills",
+            "--provider",
+            PI_PROVIDER,
+            "--model",
+            COPILOT_MODEL,
+            "--thinking",
+            "off",
+            "@plan.md",
+            task,
+        ]
 
-        aider_env = {
-            **os.environ,
-            "OPENAI_API_KEY": token,
-            "GIT_AUTHOR_NAME": "aider", "GIT_AUTHOR_EMAIL": "aider@manimflow",
-            "GIT_COMMITTER_NAME": "aider", "GIT_COMMITTER_EMAIL": "aider@manimflow",
-        }
-
-        log_queue.put(('log', 'Running aider (10-20 min)...'))
-        proc = subprocess.Popen(
-            ['aider',
-             '--model', f'openai/{COPILOT_MODEL}',
-             '--openai-api-base', COPILOT_BASE,
-             '--openai-api-key', token,
-             '--yes-always', '--no-auto-commits', '--no-pretty',
-             '--no-show-model-warnings', '--no-check-update',
-             '--map-tokens', '0',
-             '--test-cmd', f'{sys.executable} -m manim -pql --disable_caching scene.py AnimScene 2>&1',
-             '--auto-test', '--message', task, 'plan.md'],
-            cwd=str(MANIM_OUTPUT), text=True, env=aider_env,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        log_queue.put(("log", "Running Pi (this may take 10-20 minutes)..."))
+        process = subprocess.Popen(
+            command,
+            cwd=str(workspace),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
         )
-        for line in proc.stdout:
-            log_queue.put(('log', line.rstrip()))
-        proc.wait()
-        log_queue.put(('log', f'aider exit: {proc.returncode}'))
+        if process.stdout is None:
+            raise RuntimeError("Pi output stream is unavailable.")
+        for line in process.stdout:
+            log_queue.put(("log", line.rstrip()))
+        return_code = process.wait()
+        log_queue.put(("log", f"Pi exit code: {return_code}"))
 
-        videos = [v for v in MANIM_OUTPUT.rglob('*.mp4') if v.stat().st_size > 50_000]
-        if not videos:
-            log_queue.put(('error', 'No valid video rendered.'))
-            return
+        video = newest_video(workspace)
+        if video is None:
+            raise RuntimeError("Pi did not produce a valid MP4 render.")
 
-        dest = BASE / 'animation.mp4'
-        shutil.copy(sorted(videos, key=lambda p: p.stat().st_mtime)[-1], dest)
-        log_queue.put(('done', str(dest)))
+        destination = run_dir / "animation.mp4"
+        shutil.copy2(video, destination)
+        log_queue.put(("done", str(destination)))
+    except Exception as exc:
+        log_queue.put(("error", str(exc)))
 
-    except Exception as e:
-        log_queue.put(('error', str(e)))
 
-# ── UI ────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="ManimFlow", layout="wide")
+st.title("ManimFlow")
+st.caption("Describe an animation topic → get a rendered MP4")
 
-st.set_page_config(page_title='ManimFlow', layout='wide')
-st.components.v1.html(WAKELOCK_JS, height=0)
-st.title('ManimFlow')
-st.caption('Describe an animation topic → get a rendered MP4')
-
-if 'copilot_token' not in st.session_state:
-    st.session_state.copilot_token = st.query_params.get('token', None) or None
-if 'device_flow' not in st.session_state:
+if "copilot_token" not in st.session_state:
+    st.session_state.copilot_token = deployment_token() or None
+if "device_flow" not in st.session_state:
     st.session_state.device_flow = None
 
-# ── Login ─────────────────────────────────────────────────────────────────────
-
 if not st.session_state.copilot_token:
-    st.info('Login with your GitHub account to use your Copilot subscription for rendering.')
-
+    st.info("Login with GitHub to use your Copilot subscription for rendering.")
     if st.session_state.device_flow is None:
-        if st.button('Login with GitHub Copilot', type='primary'):
-            with st.spinner('Requesting device code...'):
-                flow = request_device_code()
-                st.session_state.device_flow = flow
+        if st.button("Login with GitHub Copilot", type="primary"):
+            with st.spinner("Requesting device code..."):
+                st.session_state.device_flow = request_device_code()
             st.rerun()
     else:
         flow = st.session_state.device_flow
-        st.markdown(f"""
+        st.markdown(
+            f"""
 **Step 1:** Go to **[github.com/login/device](https://github.com/login/device)**
 
 **Step 2:** Enter this code:
 
 ### `{flow['user_code']}`
 
-Then click the button below once you've authorized.
-""")
-        if st.button("I've authorized - continue", type='primary'):
-            with st.spinner('Verifying...'):
-                result = poll_token(flow['device_code'])
-            if 'access_token' in result:
-                st.session_state.copilot_token = result['access_token']
+Then continue after authorizing ManimFlow.
+"""
+        )
+        if st.button("I've authorized — continue", type="primary"):
+            with st.spinner("Verifying..."):
+                result = poll_token(flow["device_code"])
+            if "access_token" in result:
+                st.session_state.copilot_token = result["access_token"]
                 st.session_state.device_flow = None
-                st.query_params['token'] = result['access_token']
                 st.rerun()
             else:
-                st.error(f"Not authorized yet: {result.get('error', 'unknown error')}. Try again.")
+                st.error(
+                    f"Not authorized yet: {result.get('error', 'unknown error')}. Try again."
+                )
     st.stop()
 
-# ── Main app (authenticated) ──────────────────────────────────────────────────
-
 with st.sidebar:
-    st.success('Connected to GitHub Copilot')
-    if st.button('Logout'):
+    st.success("Connected to GitHub Copilot")
+    st.caption(f"Agent: Pi · Model: {COPILOT_MODEL}")
+    if deployment_token():
+        st.caption("Using the deployment's Streamlit secret.")
+    elif st.button("Logout"):
         st.session_state.copilot_token = None
         st.session_state.device_flow = None
-        st.query_params.clear()
         st.rerun()
 
-prompt = st.text_area('Animation prompt',
-    placeholder='e.g. Explain how a Fourier series builds up a square wave', height=100)
-generate = st.button('Generate', type='primary')
+prompt = st.text_area(
+    "Animation prompt",
+    placeholder="e.g. Explain how a Fourier series builds up a square wave",
+    height=100,
+)
+generate = st.button("Generate", type="primary")
 
 if generate and prompt.strip():
     log_box = st.empty()
     plan_box = st.empty()
     status = st.empty()
-
     logs = []
-    q = queue.Queue()
-
+    events = queue.Queue()
     thread = threading.Thread(
-        target=run_render, args=(st.session_state.copilot_token, prompt.strip(), q), daemon=True)
+        target=run_render,
+        args=(st.session_state.copilot_token, prompt.strip(), events),
+        daemon=True,
+    )
     thread.start()
 
     video_path = None
-    while thread.is_alive() or not q.empty():
+    while thread.is_alive() or not events.empty():
         try:
-            kind, val = q.get(timeout=0.5)
+            kind, value = events.get(timeout=0.5)
         except queue.Empty:
             continue
+        if kind == "log":
+            logs.append(value)
+            log_box.code("\n".join(logs[-80:]), language=None)
+        elif kind == "plan":
+            plan_box.info(f"**Scene plan:**\n\n{value}")
+        elif kind == "done":
+            video_path = pathlib.Path(value)
+            status.success("Render complete!")
+        elif kind == "error":
+            status.error(value)
 
-        if kind == 'log':
-            logs.append(val)
-            log_box.code('\n'.join(logs[-60:]), language=None)
-        elif kind == 'plan':
-            plan_box.info(f'**Scene plan:**\n\n{val}')
-        elif kind == 'done':
-            video_path = val
-            status.success('Render complete!')
-        elif kind == 'error':
-            status.error(val)
-
-    if video_path and pathlib.Path(video_path).exists():
-        video_bytes = pathlib.Path(video_path).read_bytes()
+    if video_path and video_path.exists():
+        video_bytes = video_path.read_bytes()
         st.video(video_bytes)
-        st.download_button('Download animation.mp4', video_bytes,
-            file_name='animation.mp4', mime='video/mp4')
+        st.download_button(
+            "Download animation.mp4",
+            video_bytes,
+            file_name="animation.mp4",
+            mime="video/mp4",
+        )

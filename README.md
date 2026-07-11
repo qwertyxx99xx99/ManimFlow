@@ -17,6 +17,35 @@ The workflow handles everything: planning scenes, writing modular Manim code, au
 
 > Only issues opened by the repo owner trigger the workflow.
 
+## Streamlit app (Pi)
+
+`streamlit_app.py` uses Pi as the autonomous coding and repair agent. Pi reads the
+scene plan, writes the Manim project, runs the renderer, and keeps fixing errors
+until an MP4 is produced.
+
+For Streamlit Community Cloud:
+
+1. Deploy this repository with `streamlit_app.py` as the entry point.
+2. In **App settings → Secrets**, add:
+
+   ```toml
+   COPILOT_TOKEN = "your-token"
+   ```
+
+3. Deploy. The app installs the pinned Pi version and an isolated Node 22 runtime
+   when necessary. Manim's system packages come from `packages.txt`.
+
+If `COPILOT_TOKEN` is omitted, the app shows GitHub's device-login flow instead.
+The token is kept in Streamlit session state, passed to Pi through its subprocess
+environment, and is never placed in the URL or written to Pi's auth file.
+
+Local development:
+
+```bash
+npm ci
+streamlit run streamlit_app.py
+```
+
 ---
 
 ## How it works
