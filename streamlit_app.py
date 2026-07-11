@@ -56,6 +56,9 @@ YOUTUBE_STORAGE_KEY = "manimflow.youtube.credentials.v1"
 _browser_storage = components.declare_component(
     "manimflow_browser_storage", path=str(APP_DIR / "browser_storage_component")
 )
+_code_browser = components.declare_component(
+    "manimflow_code_browser", path=str(APP_DIR / "code_browser_component")
+)
 PI_PROVIDER = "manimflow-copilot"
 PI_TOKEN_ENV = "MANIMFLOW_COPILOT_TOKEN"
 ANTHROPIC_TOKEN_ENV = "ANTHROPIC_OAUTH_TOKEN"
@@ -105,6 +108,39 @@ def browser_credential(action="get", value=None):
         key="youtube_browser_credentials",
         default=None,
     )
+
+
+def workspace_code_snapshot(workspace, max_file_bytes=100_000, max_total_bytes=600_000):
+    allowed_suffixes = {".py", ".md", ".toml", ".yaml", ".yml", ".json", ".txt"}
+    excluded_parts = {"manim-docs", "media", "__pycache__", ".git"}
+    files = {}
+    total = 0
+    for path in sorted(workspace.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in allowed_suffixes:
+            continue
+        relative = path.relative_to(workspace)
+        if any(part in excluded_parts or part.startswith(".") for part in relative.parts):
+            continue
+        try:
+            size = path.stat().st_size
+            if size > max_file_bytes or total + size > max_total_bytes:
+                continue
+            content = path.read_text(errors="replace")
+        except OSError:
+            continue
+        files[relative.as_posix()] = content
+        total += size
+    return files
+
+
+def code_snapshot_signature(files):
+    digest = hashlib.sha256()
+    for path, content in files.items():
+        digest.update(path.encode())
+        digest.update(b"\0")
+        digest.update(content.encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def credential_cipher(secret):
@@ -1054,6 +1090,7 @@ def _run_render(provider, credential, user_prompt, log_queue):
     workspace = run_dir / "project"
     agent_dir = run_dir / "pi-agent"
     workspace.mkdir()
+    log_queue.put(("workspace", str(workspace)))
     provider_display = {
         "gemini": "Gemini",
         "chatgpt": "ChatGPT Codex",
@@ -1527,6 +1564,7 @@ if generate and prompt.strip():
     log_box = st.empty()
     plan_box = st.empty()
     status = st.empty()
+    code_box = st.empty()
     logs = []
     last_log_render = 0.0
     events = queue.Queue()
@@ -1549,12 +1587,17 @@ if generate and prompt.strip():
     thread.start()
 
     video_path = None
+    live_workspace = None
+    last_code_refresh = 0.0
+    last_code_signature = ""
     while thread.is_alive() or not events.empty():
         try:
             kind, value = events.get(timeout=0.5)
         except queue.Empty:
-            continue
-        if kind == "log":
+            kind, value = None, None
+        if kind == "workspace":
+            live_workspace = pathlib.Path(value)
+        elif kind == "log":
             value = str(value)
             logs.append(value if value.endswith("\n") else f"{value}\n")
             now = time.monotonic()
@@ -1568,6 +1611,20 @@ if generate and prompt.strip():
             status.success("Render complete!")
         elif kind == "error":
             status.error(value)
+
+        now = time.monotonic()
+        if live_workspace and now - last_code_refresh >= 0.75:
+            files = workspace_code_snapshot(live_workspace)
+            signature = code_snapshot_signature(files)
+            if files and signature != last_code_signature:
+                code_box.empty()
+                with code_box.container():
+                    st.subheader("Live generated code")
+                    _code_browser(files=files, revision=signature, default=None)
+                st.session_state.generated_code_files = files
+                st.session_state.generated_code_revision = signature
+                last_code_signature = signature
+            last_code_refresh = now
 
     if video_path and video_path.exists():
         video_bytes = video_path.read_bytes()
@@ -1585,6 +1642,14 @@ if generate and prompt.strip():
                 "description": "An educational animation generated with ManimFlow.",
                 "tags": ["manim", "animation", "education"],
             }
+
+if not generate and st.session_state.get("generated_code_files"):
+    st.subheader("Generated code")
+    _code_browser(
+        files=st.session_state.generated_code_files,
+        revision=st.session_state.get("generated_code_revision", ""),
+        default=None,
+    )
 
 if st.session_state.get("rendered_video"):
     video_bytes = st.session_state.rendered_video

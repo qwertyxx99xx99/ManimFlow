@@ -1,0 +1,97 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #0e1117; color: #fafafa; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      #shell { display: grid; grid-template-rows: 42px 1fr; height: 520px; border: 1px solid #30343b; border-radius: 8px; overflow: hidden; }
+      #toolbar { display: flex; align-items: center; gap: 10px; padding: 6px 10px; background: #171b22; border-bottom: 1px solid #30343b; }
+      #file { flex: 1; min-width: 0; padding: 6px 8px; color: #fafafa; background: #262b34; border: 1px solid #414754; border-radius: 5px; }
+      #status { color: #9ca3af; font-size: 12px; white-space: nowrap; }
+      #editor { min-height: 0; }
+      #fallback { display: none; box-sizing: border-box; height: 100%; margin: 0; padding: 14px; overflow: auto; white-space: pre; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: #d4d4d4; background: #1e1e1e; }
+    </style>
+  </head>
+  <body>
+    <div id="shell">
+      <div id="toolbar">
+        <select id="file" aria-label="Generated file"></select>
+        <span id="status">Read only</span>
+      </div>
+      <div id="editor"><pre id="fallback"></pre></div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js"></script>
+    <script>
+      const send = (type, payload = {}) => window.parent.postMessage({ isStreamlitMessage: true, type, ...payload }, "*");
+      const select = document.getElementById("file");
+      const fallback = document.getElementById("fallback");
+      let files = {};
+      let editor = null;
+
+      function languageFor(path) {
+        const ext = (path.split(".").pop() || "").toLowerCase();
+        return ({ py: "python", md: "markdown", json: "json", toml: "ini", yaml: "yaml", yml: "yaml", txt: "plaintext" })[ext] || "plaintext";
+      }
+
+      function show(path) {
+        if (!path || !(path in files)) return;
+        sessionStorage.setItem("manimflow.code.selected", path);
+        const content = files[path] || "";
+        if (editor) {
+          const old = editor.getModel();
+          const model = monaco.editor.createModel(content, languageFor(path));
+          editor.setModel(model);
+          if (old) old.dispose();
+        } else {
+          fallback.textContent = content;
+          fallback.style.display = "block";
+        }
+      }
+
+      function update(nextFiles) {
+        files = nextFiles || {};
+        const paths = Object.keys(files).sort();
+        const previous = sessionStorage.getItem("manimflow.code.selected");
+        const selected = paths.includes(previous) ? previous : (paths.includes("scene.py") ? "scene.py" : paths[0]);
+        select.replaceChildren(...paths.map(path => {
+          const option = document.createElement("option");
+          option.value = path;
+          option.textContent = path;
+          option.selected = path === selected;
+          return option;
+        }));
+        document.getElementById("status").textContent = `${paths.length} file${paths.length === 1 ? "" : "s"} · Read only`;
+        show(selected);
+      }
+
+      select.addEventListener("change", () => show(select.value));
+      window.addEventListener("message", event => {
+        const message = event.data || {};
+        if (message.type === "streamlit:render") update(message.args?.files || {});
+      });
+
+      if (window.require) {
+        require.config({ paths: { vs: "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs" } });
+        require(["vs/editor/editor.main"], () => {
+          editor = monaco.editor.create(document.getElementById("editor"), {
+            value: "",
+            language: "plaintext",
+            theme: "vs-dark",
+            readOnly: true,
+            domReadOnly: true,
+            automaticLayout: true,
+            minimap: { enabled: true },
+            fontSize: 13,
+            scrollBeyondLastLine: false,
+            wordWrap: "off"
+          });
+          update(files);
+        }, () => { fallback.style.display = "block"; update(files); });
+      } else {
+        fallback.style.display = "block";
+      }
+      send("streamlit:componentReady", { apiVersion: 1 });
+      send("streamlit:setFrameHeight", { height: 520 });
+    </script>
+  </body>
+</html>
