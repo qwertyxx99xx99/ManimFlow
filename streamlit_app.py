@@ -542,7 +542,7 @@ def run_render(token, user_prompt, log_queue):
             "bash tools autonomously. Run the Manim test after edits, diagnose failures, "
             "and keep repairing until it renders successfully. Do not ask questions."
         )
-        command = [
+        command_prefix = [
             pi_command,
             "--mode",
             "json",
@@ -558,62 +558,81 @@ def run_render(token, user_prompt, log_queue):
             "--thinking",
             "off",
             "@plan.md",
-            task,
         ]
-
-        log_queue.put(("log", "Starting Pi agent process..."))
-        process = subprocess.Popen(
-            command,
-            cwd=str(workspace),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
-        )
-        log_queue.put(("log", f"Pi process started → PID {process.pid}"))
-        if process.stdout is None:
-            raise RuntimeError("Pi output stream is unavailable.")
-
-        raw_lines = queue.Queue()
-
-        def read_pi_output():
-            for output_line in process.stdout:
-                raw_lines.put(output_line)
-
-        reader = threading.Thread(target=read_pi_output, daemon=True)
-        reader.start()
-        output_started = False
         observed_doc_reads = set()
-        launched_at = time.monotonic()
-        while reader.is_alive() or not raw_lines.empty():
-            try:
-                output_line = raw_lines.get(timeout=1)
-            except queue.Empty:
-                output_line = None
-            if output_line is not None:
-                output_started = True
-                observe_documentation_read(output_line, workspace, observed_doc_reads)
-                update = concise_pi_event(output_line)
-                if update:
-                    log_queue.put(("log", update))
-            elif not output_started and time.monotonic() - launched_at >= 60:
-                process.terminate()
-                raise RuntimeError(
-                    "Pi passed version/model preflight but emitted zero agent output for 60 seconds."
+        video = None
+        max_attempts = 4
+        for attempt in range(1, max_attempts + 1):
+            log_queue.put(("log", f"Starting Pi agent attempt {attempt}/{max_attempts}..."))
+            process = subprocess.Popen(
+                [*command_prefix, task],
+                cwd=str(workspace),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+            log_queue.put(("log", f"Pi process started → PID {process.pid}"))
+            if process.stdout is None:
+                raise RuntimeError("Pi output stream is unavailable.")
+
+            raw_lines = queue.Queue()
+
+            def read_pi_output():
+                for output_line in process.stdout:
+                    raw_lines.put(output_line)
+
+            reader = threading.Thread(target=read_pi_output, daemon=True)
+            reader.start()
+            output_started = False
+            launched_at = time.monotonic()
+            while reader.is_alive() or not raw_lines.empty():
+                try:
+                    output_line = raw_lines.get(timeout=1)
+                except queue.Empty:
+                    output_line = None
+                if output_line is not None:
+                    output_started = True
+                    observe_documentation_read(output_line, workspace, observed_doc_reads)
+                    update = concise_pi_event(output_line)
+                    if update:
+                        log_queue.put(("log", update))
+                elif not output_started and time.monotonic() - launched_at >= 60:
+                    process.terminate()
+                    raise RuntimeError(
+                        "Pi passed version/model preflight but emitted zero agent output for 60 seconds."
+                    )
+            reader.join(timeout=1)
+            return_code = process.wait()
+            log_queue.put(("log", f"Pi attempt {attempt} exit code: {return_code}"))
+
+            video = newest_video(workspace)
+            if video is not None:
+                break
+
+            missing_scene = not (workspace / "scene.py").is_file()
+            state = "scene.py is missing" if missing_scene else "scene.py exists but no valid MP4 was rendered"
+            if attempt < max_attempts:
+                log_queue.put(
+                    ("log", f"Attempt {attempt} was incomplete ({state}); continuing autonomously...")
                 )
-        reader.join(timeout=1)
-        return_code = process.wait()
-        log_queue.put(("log", f"Pi exit code: {return_code}"))
+                task = (
+                    f"The previous attempt exited prematurely: {state}. Continue from the existing "
+                    "workspace; do not restart or merely explain. Inspect every current file, finish "
+                    "scene.py and all required helpers, run the exact Manim test from AGENTS.md, fix "
+                    "all failures, and verify that a non-empty MP4 exists before stopping."
+                )
 
         validate_documentation_gate(workspace, observed_doc_reads)
         log_queue.put(
             ("log", f"Documentation gate passed → {len(observed_doc_reads)} distinct files read")
         )
-        video = newest_video(workspace)
         if video is None:
-            raise RuntimeError("Pi did not produce a valid MP4 render.")
+            raise RuntimeError(
+                f"Pi did not produce a valid MP4 after {max_attempts} autonomous attempts."
+            )
 
         destination = run_dir / "animation.mp4"
         shutil.copy2(video, destination)
