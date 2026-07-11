@@ -381,8 +381,8 @@ def run_render(token, user_prompt, log_queue):
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+            text=False,
+            bufsize=0,
         )
         if process.stdout is None:
             raise RuntimeError("Pi output stream is unavailable.")
@@ -390,8 +390,11 @@ def run_render(token, user_prompt, log_queue):
         raw_lines = queue.Queue()
 
         def read_pi_output():
-            for output_line in process.stdout:
-                raw_lines.put(output_line)
+            while True:
+                chunk = os.read(process.stdout.fileno(), 4096)
+                if not chunk:
+                    break
+                raw_lines.put(chunk.decode("utf-8", errors="replace"))
 
         reader = threading.Thread(target=read_pi_output, daemon=True)
         reader.start()
@@ -401,9 +404,7 @@ def run_render(token, user_prompt, log_queue):
             except queue.Empty:
                 output_line = None
             if output_line is not None:
-                update = concise_pi_event(output_line)
-                if update:
-                    log_queue.put(("log", update))
+                log_queue.put(("log", output_line))
         reader.join(timeout=1)
         return_code = process.wait()
         log_queue.put(("log", f"Pi exit code: {return_code}"))
@@ -483,6 +484,7 @@ if generate and prompt.strip():
     plan_box = st.empty()
     status = st.empty()
     logs = []
+    last_log_render = 0.0
     events = queue.Queue()
     thread = threading.Thread(
         target=run_render,
@@ -498,8 +500,12 @@ if generate and prompt.strip():
         except queue.Empty:
             continue
         if kind == "log":
-            logs.append(value)
-            log_box.code("\n".join(logs[-80:]), language=None)
+            value = str(value)
+            logs.append(value if value.endswith("\n") else f"{value}\n")
+            now = time.monotonic()
+            if now - last_log_render >= 0.25 or events.empty():
+                log_box.code("".join(logs[-80:]), language=None)
+                last_log_render = now
         elif kind == "plan":
             plan_box.info(f"**Scene plan:**\n\n{value}")
         elif kind == "done":
