@@ -39,13 +39,24 @@ function contextToPrompt(context: Context): string {
     "For the write tool, arguments MUST be ordered as path first and content second: {\"tool\":\"write\",\"arguments\":{\"path\":\"file.py\",\"content\":\"...\"}}.",
     "Keep each file small and focused. Prefer multiple helper files over one write whose content exceeds 4000 characters.",
     "Never describe a tool call or place it in a markdown fence.",
+    "Never repeat or quote an earlier [tool call ...] or TOOLRESULT transcript. Those actions already happened.",
+    "After a tool result, either request the next tool with the strict JSON envelope or give a concise final answer.",
   ];
 
   if (context.systemPrompt) sections.push(`SYSTEM:\n${context.systemPrompt}`);
   for (const message of context.messages) {
-    sections.push(
-      `${String(message.role || "user").toUpperCase()}:\n${contentToText(message.content)}`,
-    );
+    const role = String(message.role || "user");
+    const content = contentToText(message.content);
+    if (role === "toolResult") {
+      const toolName = String((message as any).toolName || "tool");
+      sections.push(
+        `RESULT FROM ALREADY EXECUTED TOOL ${toolName}:\n${content.slice(-12000)}\nDo not repeat this result or its tool call. Continue from it.`,
+      );
+    } else if (role === "assistant" && Array.isArray(message.content) && message.content.some((part: any) => part?.type === "toolCall")) {
+      sections.push(`PREVIOUS ASSISTANT TOOL REQUEST, ALREADY EXECUTED:\n${content}`);
+    } else {
+      sections.push(`${role.toUpperCase()}:\n${content}`);
+    }
   }
   return sections.join("\n\n");
 }
@@ -58,8 +69,31 @@ function parseToolRequest(text: string, context: Context) {
     .trim();
 
   let value: any;
+  const transcriptMatch = candidate.match(
+    /^\[tool call\s+([A-Za-z0-9_-]+)\s*:\s*([\s\S]*?)\]\s*(?:TOOLRESULT:|$)/i,
+  );
+  if (transcriptMatch) {
+    try {
+      value = { tool: transcriptMatch[1], arguments: JSON.parse(transcriptMatch[2]) };
+    } catch {
+      // Exa occasionally emits a shell executable with an unescaped closing
+      // quote, for example: {"command":"/path/python3" -m manim ...}.
+      // Repair that one known transcript shape instead of presenting it as a
+      // final assistant response and making Pi exit successfully.
+      const commandMatch = transcriptMatch[2].match(
+        /^\{\s*"command"\s*:\s*"([\s\S]*)"?\s*\}\s*$/,
+      );
+      if (transcriptMatch[1] === "bash" && commandMatch) {
+        let command = commandMatch[1];
+        if ((command.match(/"/g) || []).length % 2 === 1) command = `"${command}`;
+        value = { tool: "bash", arguments: { command } };
+      } else {
+        value = null;
+      }
+    }
+  }
   try {
-    value = JSON.parse(candidate);
+    if (!value) value = JSON.parse(candidate);
   } catch {
     // Some models fail to escape quotes inside a shell command. Recover only
     // the narrow, explicit tool envelope and leave all other malformed JSON as text.
