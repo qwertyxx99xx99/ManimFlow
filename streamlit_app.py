@@ -343,7 +343,7 @@ def write_project_files(workspace, user_prompt, plan):
         "Read plan.md before editing. Work without asking questions.\n"
         "MANDATORY DOCUMENTATION GATE — complete this before writing any Python:\n"
         "1. Identify every Manim class, animation, object, layout helper, and renderer feature you plan to use.\n"
-        "2. Search the local manim-docs/ tree with command-line tools such as rg and find. Do not use the web.\n"
+        "2. Search only manim-docs/source/ with focused commands such as `rg -l 'Pattern' manim-docs/source`. Do not search manim-docs/i18n, do not dump broad match output, and do not use the web.\n"
         "3. Use Pi's read tool (not only grep/cat) to read the relevant local documentation for every planned part. Read at least three distinct relevant documentation files.\n"
         "4. Create docs_consulted.md before any .py file. For each planned API, record the exact manim-docs/ path actually read and the key constraint or usage learned. Cite no file you did not read with the read tool.\n"
         "Do not start implementation until docs_consulted.md is complete.\n"
@@ -470,6 +470,15 @@ def concise_pi_event(line):
         return line[:1000]
 
     event_type = event.get("type")
+    if event_type == "auto_retry_start":
+        return (
+            f"Provider retry {event.get('attempt')}/{event.get('maxAttempts')} in "
+            f"{event.get('delayMs', 0) / 1000:g}s: {event.get('errorMessage', 'unknown error')}"
+        )
+    if event_type == "auto_retry_end":
+        if event.get("success"):
+            return "Provider retry succeeded."
+        return f"Provider retry failed: {event.get('finalError', 'unknown error')}"
     if event_type == "tool_execution_start":
         name = event.get("toolName", "tool")
         arguments = event.get("args") or {}
@@ -521,6 +530,20 @@ def concise_pi_event(line):
             if text:
                 updates.append(f"Pi: {text[:1500]}")
     return "\n".join(updates) or None
+
+
+def is_rate_limit_event(line):
+    if line.startswith('{"type":"message_update"'):
+        return False
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        lowered = line.lower()
+        return "http error 429" in lowered or "too many requests" in lowered
+    if event.get("type") not in {"auto_retry_start", "auto_retry_end"}:
+        return False
+    error_text = f"{event.get('errorMessage', '')} {event.get('finalError', '')}".lower()
+    return "429" in error_text or "too many requests" in error_text
 
 
 def _run_render(provider, credential, user_prompt, log_queue):
@@ -639,7 +662,7 @@ def _run_render(provider, credential, user_prompt, log_queue):
             "--model",
             pi_model,
             "--thinking",
-            "off",
+            "medium" if provider == "gemini" else "off",
             "@plan.md",
         ]
         observed_doc_reads = set()
@@ -679,8 +702,7 @@ def _run_render(provider, credential, user_prompt, log_queue):
                     output_line = None
                 if output_line is not None:
                     output_started = True
-                    lowered_output = output_line.lower()
-                    if "429" in lowered_output or "too many requests" in lowered_output:
+                    if is_rate_limit_event(output_line):
                         rate_limited = True
                     observe_documentation_read(output_line, workspace, observed_doc_reads)
                     update = concise_pi_event(output_line)
