@@ -1,4 +1,8 @@
 import json
+import base64
+import hashlib
+import hmac
+import io
 import os
 import pathlib
 import queue
@@ -14,6 +18,13 @@ import urllib.error
 import urllib.request
 
 import streamlit as st
+import streamlit.components.v1 as components
+from cryptography.fernet import Fernet, InvalidToken
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build as google_api_build
+from googleapiclient.http import MediaIoBaseUpload
 
 
 BASE = pathlib.Path("/tmp/manimflow_workspace")
@@ -38,6 +49,11 @@ EXA_ENDPOINT = os.environ.get(
 )
 EXA_MODEL = os.environ.get("EXA_MODEL", "google/gemini-2.5-flash")
 EXA_EXTENSION = APP_DIR / "pi_extensions" / "exa_direct.ts"
+YOUTUBE_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+YOUTUBE_STORAGE_KEY = "manimflow.youtube.credentials.v1"
+_browser_storage = components.declare_component(
+    "manimflow_browser_storage", path=str(APP_DIR / "browser_storage_component")
+)
 PI_PROVIDER = "manimflow-copilot"
 PI_TOKEN_ENV = "MANIMFLOW_COPILOT_TOKEN"
 
@@ -66,6 +82,110 @@ def secret_value(name):
 
 def deployment_token():
     return secret_value("COPILOT_TOKEN")
+
+
+def youtube_config():
+    return {
+        "client_id": secret_value("YOUTUBE_CLIENT_ID"),
+        "client_secret": secret_value("YOUTUBE_CLIENT_SECRET"),
+        "redirect_uri": secret_value("YOUTUBE_REDIRECT_URI"),
+        "encryption_key": secret_value("YOUTUBE_TOKEN_ENCRYPTION_KEY"),
+    }
+
+
+def browser_credential(action="get", value=None):
+    return _browser_storage(
+        action=action,
+        storageKey=YOUTUBE_STORAGE_KEY,
+        value=value or "",
+        key="youtube_browser_credentials",
+        default=None,
+    )
+
+
+def credential_cipher(secret):
+    key = base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest())
+    return Fernet(key)
+
+
+def encrypt_youtube_credentials(credentials, secret):
+    payload = json.dumps(
+        {
+            "token": credentials.token,
+            "refresh_token": credentials.refresh_token,
+            "token_uri": credentials.token_uri,
+            "client_id": credentials.client_id,
+            "client_secret": credentials.client_secret,
+            "scopes": list(credentials.scopes or [YOUTUBE_SCOPE]),
+        }
+    ).encode()
+    return credential_cipher(secret).encrypt(payload).decode()
+
+
+def decrypt_youtube_credentials(encrypted, secret):
+    try:
+        payload = json.loads(credential_cipher(secret).decrypt(encrypted.encode()))
+    except (InvalidToken, ValueError, json.JSONDecodeError):
+        return None
+    return Credentials(**payload)
+
+
+def youtube_oauth_flow(config, state=None):
+    flow = Flow.from_client_config(
+        {
+            "web": {
+                "client_id": config["client_id"],
+                "client_secret": config["client_secret"],
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": [config["redirect_uri"]],
+            }
+        },
+        scopes=[YOUTUBE_SCOPE],
+        state=state,
+    )
+    flow.redirect_uri = config["redirect_uri"]
+    return flow
+
+
+def youtube_login_url(config):
+    timestamp = str(int(time.time()))
+    nonce = base64.urlsafe_b64encode(os.urandom(18)).decode().rstrip("=")
+    payload = f"{timestamp}.{nonce}"
+    signature = hmac.new(
+        config["encryption_key"].encode(), payload.encode(), hashlib.sha256
+    ).hexdigest()
+    state = f"{payload}.{signature}"
+    flow = youtube_oauth_flow(config, state=state)
+    url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+        state=state,
+    )
+    return url
+
+
+def valid_youtube_oauth_state(state, secret, max_age_seconds=15 * 60):
+    try:
+        timestamp, nonce, supplied = state.split(".", 2)
+        payload = f"{timestamp}.{nonce}"
+        expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        age = int(time.time()) - int(timestamp)
+        return hmac.compare_digest(supplied, expected) and 0 <= age <= max_age_seconds
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def restore_youtube_credentials(encrypted, config):
+    if not encrypted or not config["encryption_key"]:
+        return None
+    credentials = decrypt_youtube_credentials(encrypted, config["encryption_key"])
+    if not credentials:
+        return None
+    if credentials.expired and credentials.refresh_token:
+        credentials.refresh(GoogleAuthRequest())
+    return credentials
 
 
 def poll_token(device_code):
@@ -263,6 +383,74 @@ def exa_chat(messages, log_queue=None):
     if not result:
         raise RuntimeError("Exa returned no planner content.")
     return result
+
+
+def parse_metadata_json(text):
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", str(text).strip(), flags=re.I)
+    match = re.search(r"\{[\s\S]*\}", cleaned)
+    if not match:
+        raise ValueError("The model did not return metadata JSON.")
+    data = json.loads(match.group(0))
+    tags = data.get("tags", [])
+    if isinstance(tags, str):
+        tags = [tag.strip() for tag in tags.split(",") if tag.strip()]
+    return {
+        "title": str(data.get("title") or "Manim animation")[:100],
+        "description": str(data.get("description") or "Generated with ManimFlow"),
+        "tags": [str(tag)[:30] for tag in tags[:20]],
+    }
+
+
+def suggest_youtube_metadata(provider, credential, user_prompt):
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Create accurate YouTube metadata for a short educational Manim animation. "
+                "Return only strict JSON with title, description, and tags. Title must be under "
+                "100 characters. tags must be an array of at most 12 concise strings. Do not "
+                "invent claims about animation content beyond the user's prompt."
+            ),
+        },
+        {"role": "user", "content": user_prompt},
+    ]
+    if provider == "gemini":
+        response = gemini_chat(credential, messages)
+    elif provider == "exa":
+        response = exa_chat(messages)
+    else:
+        response = copilot_chat(credential, messages)
+    return parse_metadata_json(response)
+
+
+def upload_to_youtube(video_bytes, credentials, title, description, tags, privacy, progress):
+    youtube = google_api_build("youtube", "v3", credentials=credentials, cache_discovery=False)
+    media = MediaIoBaseUpload(
+        io.BytesIO(video_bytes),
+        mimetype="video/mp4",
+        chunksize=4 * 1024 * 1024,
+        resumable=True,
+    )
+    request = youtube.videos().insert(
+        part="snippet,status",
+        body={
+            "snippet": {
+                "title": title,
+                "description": description,
+                "tags": tags,
+                "categoryId": "27",
+            },
+            "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": False},
+        },
+        media_body=media,
+    )
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
+        if status:
+            progress.progress(min(float(status.progress()), 1.0))
+    progress.progress(1.0)
+    return response["id"]
 
 
 def node_major(node_command):
@@ -919,6 +1107,51 @@ st.set_page_config(page_title="ManimFlow", layout="wide")
 st.title("ManimFlow")
 st.caption("Describe an animation topic → get a rendered MP4")
 
+youtube_settings = youtube_config()
+youtube_ready = all(youtube_settings.values())
+oauth_code = st.query_params.get("code")
+oauth_error = st.query_params.get("error")
+if oauth_error:
+    st.error(f"YouTube login failed: {oauth_error}")
+    st.query_params.clear()
+elif oauth_code and youtube_ready:
+    returned_state = st.query_params.get("state", "")
+    if not valid_youtube_oauth_state(
+        returned_state, youtube_settings["encryption_key"]
+    ):
+        st.error("YouTube login state did not match. Please start login again.")
+    else:
+        try:
+            flow = youtube_oauth_flow(youtube_settings, state=returned_state)
+            flow.fetch_token(code=oauth_code)
+            encrypted = encrypt_youtube_credentials(
+                flow.credentials, youtube_settings["encryption_key"]
+            )
+            st.session_state.youtube_storage_action = ("set", encrypted)
+            st.session_state.youtube_login_complete = True
+        except Exception as exc:
+            st.error(f"Unable to complete YouTube login: {exc}")
+    st.query_params.clear()
+    st.rerun()
+
+storage_action, storage_value = st.session_state.get(
+    "youtube_storage_action", ("get", None)
+)
+stored_youtube_credential = browser_credential(storage_action, storage_value)
+if storage_action == "set" and stored_youtube_credential == storage_value:
+    del st.session_state.youtube_storage_action
+elif storage_action == "delete" and stored_youtube_credential is None:
+    del st.session_state.youtube_storage_action
+
+youtube_credentials = None
+if youtube_ready and stored_youtube_credential:
+    try:
+        youtube_credentials = restore_youtube_credentials(
+            stored_youtube_credential, youtube_settings
+        )
+    except Exception as exc:
+        st.warning(f"Stored YouTube login could not be refreshed: {exc}")
+
 provider_label = st.radio(
     "Model provider",
     ["GitHub Copilot", "Google Gemini", "Exa"],
@@ -1000,6 +1233,24 @@ with st.sidebar:
             st.session_state.device_flow = None
             st.rerun()
 
+    st.divider()
+    st.subheader("YouTube")
+    if not youtube_ready:
+        st.caption("YouTube upload secrets are incomplete.")
+    elif youtube_credentials:
+        st.success("Account connected")
+        if st.button("Disconnect YouTube", key="sidebar_youtube_disconnect"):
+            st.session_state.youtube_storage_action = ("delete", None)
+            st.session_state.pop("youtube_login_complete", None)
+            st.rerun()
+    else:
+        st.link_button(
+            "Connect YouTube account",
+            youtube_login_url(youtube_settings),
+            type="primary",
+        )
+        st.caption("Connect before generating so the render remains in this session.")
+
 prompt = st.text_area(
     "Animation prompt",
     placeholder="e.g. Explain how a Fourier series builds up a square wave",
@@ -1051,10 +1302,85 @@ if generate and prompt.strip():
 
     if video_path and video_path.exists():
         video_bytes = video_path.read_bytes()
-        st.video(video_bytes)
-        st.download_button(
-            "Download animation.mp4",
-            video_bytes,
-            file_name="animation.mp4",
-            mime="video/mp4",
+        st.session_state.rendered_video = video_bytes
+        st.session_state.rendered_prompt = prompt.strip()
+        st.session_state.rendered_provider = selected_provider
+        try:
+            with st.spinner("Suggesting YouTube metadata..."):
+                st.session_state.youtube_metadata = suggest_youtube_metadata(
+                    selected_provider, credential, prompt.strip()
+                )
+        except Exception:
+            st.session_state.youtube_metadata = {
+                "title": prompt.strip()[:100] or "Manim animation",
+                "description": "An educational animation generated with ManimFlow.",
+                "tags": ["manim", "animation", "education"],
+            }
+
+if st.session_state.get("rendered_video"):
+    video_bytes = st.session_state.rendered_video
+    st.video(video_bytes)
+    st.download_button(
+        "Download animation.mp4",
+        video_bytes,
+        file_name="animation.mp4",
+        mime="video/mp4",
+    )
+
+    st.divider()
+    st.subheader("Upload to YouTube")
+    metadata = st.session_state.get(
+        "youtube_metadata",
+        {
+            "title": "Manim animation",
+            "description": "Generated with ManimFlow.",
+            "tags": ["manim", "animation"],
+        },
+    )
+
+    if not youtube_ready:
+        st.warning(
+            "YouTube upload is not configured. Add YOUTUBE_CLIENT_ID, "
+            "YOUTUBE_CLIENT_SECRET, YOUTUBE_REDIRECT_URI and "
+            "YOUTUBE_TOKEN_ENCRYPTION_KEY to Streamlit Secrets."
         )
+    elif not youtube_credentials:
+        if st.session_state.pop("youtube_login_complete", False):
+            st.info("Saving your YouTube login in this browser...")
+        login_url = youtube_login_url(youtube_settings)
+        st.link_button("Connect YouTube account", login_url, type="primary")
+        st.caption(
+            "Your encrypted login is stored only in this browser. Connecting may reload "
+            "the app, so connecting before generation is recommended."
+        )
+    else:
+        st.success("YouTube account connected")
+
+        with st.form("youtube_upload_form"):
+            title = st.text_input("Title", value=metadata["title"], max_chars=100)
+            description = st.text_area(
+                "Description", value=metadata["description"], height=180
+            )
+            tags_text = st.text_input("Tags", value=", ".join(metadata["tags"]))
+            privacy = st.selectbox(
+                "Privacy", ["private", "unlisted", "public"], index=0
+            )
+            upload = st.form_submit_button("Upload to YouTube", type="primary")
+
+        if upload:
+            tags = [tag.strip() for tag in tags_text.split(",") if tag.strip()][:20]
+            progress = st.progress(0.0, text="Uploading to YouTube...")
+            try:
+                video_id = upload_to_youtube(
+                    video_bytes,
+                    youtube_credentials,
+                    title.strip(),
+                    description,
+                    tags,
+                    privacy,
+                    progress,
+                )
+                st.success(f"Uploaded successfully: https://youtu.be/{video_id}")
+                st.link_button("Open on YouTube", f"https://youtu.be/{video_id}")
+            except Exception as exc:
+                st.error(f"YouTube upload failed: {exc}")
