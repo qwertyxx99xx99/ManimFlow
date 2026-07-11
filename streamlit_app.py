@@ -159,7 +159,6 @@ def youtube_login_url(config):
     flow = youtube_oauth_flow(config, state=state)
     url, _ = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes="true",
         prompt="consent",
         state=state,
     )
@@ -1112,14 +1111,17 @@ youtube_ready = all(youtube_settings.values())
 oauth_code = st.query_params.get("code")
 oauth_error = st.query_params.get("error")
 if oauth_error:
-    st.error(f"YouTube login failed: {oauth_error}")
+    st.session_state.youtube_oauth_error = f"YouTube login failed: {oauth_error}"
     st.query_params.clear()
+    st.rerun()
 elif oauth_code and youtube_ready:
     returned_state = st.query_params.get("state", "")
     if not valid_youtube_oauth_state(
         returned_state, youtube_settings["encryption_key"]
     ):
-        st.error("YouTube login state did not match. Please start login again.")
+        st.session_state.youtube_oauth_error = (
+            "YouTube login state did not match or expired. Please start login again."
+        )
     else:
         try:
             flow = youtube_oauth_flow(youtube_settings, state=returned_state)
@@ -1129,10 +1131,22 @@ elif oauth_code and youtube_ready:
             )
             st.session_state.youtube_storage_action = ("set", encrypted)
             st.session_state.youtube_login_complete = True
+            st.session_state.pop("youtube_oauth_error", None)
         except Exception as exc:
-            st.error(f"Unable to complete YouTube login: {exc}")
+            st.session_state.youtube_oauth_error = (
+                f"Unable to complete YouTube login: {exc}"
+            )
     st.query_params.clear()
     st.rerun()
+elif oauth_code and not youtube_ready:
+    st.session_state.youtube_oauth_error = (
+        "YouTube OAuth returned to the app, but its Streamlit secrets are incomplete."
+    )
+    st.query_params.clear()
+    st.rerun()
+
+if st.session_state.get("youtube_oauth_error"):
+    st.error(st.session_state.youtube_oauth_error)
 
 storage_action, storage_value = st.session_state.get(
     "youtube_storage_action", ("get", None)
