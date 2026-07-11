@@ -242,6 +242,55 @@ def clean_old_runs(max_age_seconds=6 * 60 * 60):
             pass
 
 
+def concise_pi_event(line):
+    line = line.strip()
+    if not line:
+        return None
+    # These token-level events contain an increasingly large copy of the whole
+    # partial message. Parsing or rendering them can freeze a Streamlit session.
+    if line.startswith('{"type":"message_update"'):
+        return None
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return line[:1000]
+
+    event_type = event.get("type")
+    if event_type == "agent_start":
+        return "Pi agent started."
+    if event_type == "agent_end":
+        return "Pi agent finished."
+    if event_type != "message_end":
+        return None
+
+    message = event.get("message", {})
+    role = message.get("role")
+    content = message.get("content", [])
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+
+    updates = []
+    for block in content:
+        block_type = block.get("type")
+        if block_type == "toolCall":
+            name = block.get("name", "tool")
+            arguments = block.get("arguments") or {}
+            if name in {"write", "edit", "read"}:
+                detail = arguments.get("path", "")
+            elif name == "bash":
+                detail = arguments.get("command", "")
+            else:
+                detail = ""
+            detail = str(detail).replace("\n", " ")[:300]
+            updates.append(f"Pi → {name}: {detail}".rstrip())
+        elif block_type == "text" and role in {"assistant", "toolResult"}:
+            text = str(block.get("text", "")).strip()
+            if text:
+                prefix = "Result" if role == "toolResult" else "Pi"
+                updates.append(f"{prefix}: {text[:1000]}")
+    return "\n".join(updates) or None
+
+
 def run_render(token, user_prompt, log_queue):
     clean_old_runs()
     run_dir = pathlib.Path(tempfile.mkdtemp(prefix="run-", dir=BASE))
@@ -315,8 +364,31 @@ def run_render(token, user_prompt, log_queue):
         )
         if process.stdout is None:
             raise RuntimeError("Pi output stream is unavailable.")
-        for line in process.stdout:
-            log_queue.put(("log", line.rstrip()))
+
+        raw_lines = queue.Queue()
+
+        def read_pi_output():
+            for output_line in process.stdout:
+                raw_lines.put(output_line)
+
+        reader = threading.Thread(target=read_pi_output, daemon=True)
+        reader.start()
+        started_at = time.monotonic()
+        last_heartbeat = started_at
+        while reader.is_alive() or not raw_lines.empty():
+            try:
+                output_line = raw_lines.get(timeout=1)
+            except queue.Empty:
+                now = time.monotonic()
+                if now - last_heartbeat >= 15:
+                    elapsed = int(now - started_at)
+                    log_queue.put(("log", f"Pi is still working... ({elapsed}s elapsed)"))
+                    last_heartbeat = now
+                continue
+            update = concise_pi_event(output_line)
+            if update:
+                log_queue.put(("log", update))
+        reader.join(timeout=1)
         return_code = process.wait()
         log_queue.put(("log", f"Pi exit code: {return_code}"))
 
