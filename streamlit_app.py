@@ -1246,7 +1246,7 @@ def _run_render(provider, credential, user_prompt, log_queue):
         observed_doc_reads = set()
         pi_tool_details = {}
         video = None
-        max_attempts = 4
+        max_attempts = 6
         for attempt in range(1, max_attempts + 1):
             log_queue.put(("log", f"Starting Pi agent attempt {attempt}/{max_attempts}..."))
             process = subprocess.Popen(
