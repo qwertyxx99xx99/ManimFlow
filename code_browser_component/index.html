@@ -3,68 +3,166 @@
   <head>
     <meta charset="utf-8" />
     <style>
-      html, body { margin: 0; height: 100%; overflow: hidden; background: #0e1117; color: #fafafa; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-      #shell { display: grid; grid-template-rows: 42px 1fr; height: 520px; border: 1px solid #30343b; border-radius: 8px; overflow: hidden; }
-      #toolbar { display: flex; align-items: center; gap: 10px; padding: 6px 10px; background: #171b22; border-bottom: 1px solid #30343b; }
-      #file { flex: 1; min-width: 0; padding: 6px 8px; color: #fafafa; background: #262b34; border: 1px solid #414754; border-radius: 5px; }
-      #status { color: #9ca3af; font-size: 12px; white-space: nowrap; }
-      #editor { min-height: 0; }
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #1e1e1e; color: #cccccc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      #shell { display: grid; grid-template-columns: 235px minmax(0, 1fr); height: 560px; border: 1px solid #3c3c3c; border-radius: 7px; overflow: hidden; background: #1e1e1e; }
+      #sidebar { min-width: 0; background: #181818; border-right: 1px solid #2b2b2b; display: grid; grid-template-rows: 35px 26px 1fr; }
+      #activity-title { display: flex; align-items: center; padding: 0 14px; color: #bbbbbb; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
+      #workspace-title { display: flex; align-items: center; gap: 5px; padding: 0 8px; color: #cccccc; font-size: 11px; font-weight: 600; text-transform: uppercase; border-top: 1px solid #252525; }
+      #workspace-title::before { content: "⌄"; font-size: 14px; }
+      #tree { overflow: auto; padding: 3px 0 10px; font-size: 13px; user-select: none; }
+      .folder > summary { cursor: pointer; list-style: none; height: 23px; display: flex; align-items: center; padding-left: calc(8px + var(--depth) * 13px); white-space: nowrap; }
+      .folder > summary::-webkit-details-marker { display: none; }
+      .folder > summary::before { content: "›"; width: 14px; color: #c5c5c5; font-size: 16px; transform-origin: 45% 50%; }
+      .folder[open] > summary::before { transform: rotate(90deg); }
+      .folder > summary:hover, .file:hover { background: #2a2d2e; }
+      .folder-name::before { content: "▰"; color: #dcb67a; margin-right: 6px; font-size: 11px; }
+      .file { width: 100%; height: 23px; display: flex; align-items: center; gap: 6px; padding: 0 8px 0 calc(22px + var(--depth) * 13px); color: #cccccc; background: transparent; border: 0; text-align: left; cursor: pointer; white-space: nowrap; overflow: hidden; }
+      .file.active { color: #ffffff; background: #37373d; }
+      .file-label { overflow: hidden; text-overflow: ellipsis; }
+      .icon { width: 15px; flex: 0 0 15px; text-align: center; font-size: 11px; font-weight: 700; }
+      .icon.py { color: #75beff; } .icon.md { color: #519aba; } .icon.json { color: #f1c40f; } .icon.config { color: #c586c0; } .icon.txt { color: #aaaaaa; }
+      #main { min-width: 0; display: grid; grid-template-rows: 35px 1fr 22px; }
+      #tabs { background: #181818; display: flex; align-items: stretch; border-bottom: 1px solid #2b2b2b; overflow: hidden; }
+      #tab { min-width: 145px; max-width: 300px; display: flex; align-items: center; gap: 7px; padding: 0 12px; background: #1e1e1e; border-top: 1px solid #007acc; color: #ffffff; font-size: 13px; }
+      #tab-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #editor-wrap { min-height: 0; position: relative; }
+      #editor { position: absolute; inset: 0; }
       #fallback { display: none; box-sizing: border-box; height: 100%; margin: 0; padding: 14px; overflow: auto; white-space: pre; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: #d4d4d4; background: #1e1e1e; }
+      #statusbar { display: flex; justify-content: space-between; align-items: center; padding: 0 8px; color: white; background: #007acc; font-size: 11px; }
+      #empty { padding: 12px; color: #888888; font-size: 12px; }
     </style>
   </head>
   <body>
     <div id="shell">
-      <div id="toolbar">
-        <select id="file" aria-label="Generated file"></select>
-        <span id="status">Read only</span>
-      </div>
-      <div id="editor"><pre id="fallback"></pre></div>
+      <aside id="sidebar">
+        <div id="activity-title">Explorer</div>
+        <div id="workspace-title">ManimFlow</div>
+        <div id="tree"></div>
+      </aside>
+      <main id="main">
+        <div id="tabs"><div id="tab"><span id="tab-icon" class="icon"></span><span id="tab-name">No file</span></div></div>
+        <div id="editor-wrap"><div id="editor"></div><pre id="fallback"></pre></div>
+        <div id="statusbar"><span>Read only</span><span id="status">0 files</span></div>
+      </main>
     </div>
     <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js"></script>
     <script>
       const send = (type, payload = {}) => window.parent.postMessage({ isStreamlitMessage: true, type, ...payload }, "*");
-      const select = document.getElementById("file");
+      const tree = document.getElementById("tree");
       const fallback = document.getElementById("fallback");
       let files = {};
+      let selectedPath = "";
       let editor = null;
+      const models = new Map();
 
-      function languageFor(path) {
-        const ext = (path.split(".").pop() || "").toLowerCase();
-        return ({ py: "python", md: "markdown", json: "json", toml: "ini", yaml: "yaml", yml: "yaml", txt: "plaintext" })[ext] || "plaintext";
+      function extension(path) { return (path.split(".").pop() || "").toLowerCase(); }
+      function languageFor(path) { return ({ py: "python", md: "markdown", json: "json", toml: "ini", yaml: "yaml", yml: "yaml", txt: "plaintext" })[extension(path)] || "plaintext"; }
+      function iconInfo(path) {
+        const ext = extension(path);
+        if (ext === "py") return ["py", "PY"];
+        if (ext === "md") return ["md", "M↓"];
+        if (ext === "json") return ["json", "{}"];
+        if (["toml", "yaml", "yml"].includes(ext)) return ["config", "⚙"];
+        return ["txt", "≡"];
       }
 
-      function show(path) {
-        if (!path || !(path in files)) return;
-        sessionStorage.setItem("manimflow.code.selected", path);
-        const content = files[path] || "";
-        if (editor) {
-          const old = editor.getModel();
-          const model = monaco.editor.createModel(content, languageFor(path));
-          editor.setModel(model);
-          if (old) old.dispose();
-        } else {
-          fallback.textContent = content;
-          fallback.style.display = "block";
+      function buildTree(paths) {
+        const root = { folders: {}, files: [] };
+        for (const path of paths) {
+          const parts = path.split("/");
+          const file = parts.pop();
+          let node = root;
+          for (const part of parts) node = node.folders[part] ||= { folders: {}, files: [] };
+          node.files.push({ name: file, path });
         }
+        return root;
+      }
+
+      function renderNode(node, container, depth) {
+        for (const name of Object.keys(node.folders).sort()) {
+          const details = document.createElement("details");
+          details.className = "folder";
+          details.open = true;
+          details.style.setProperty("--depth", depth);
+          const summary = document.createElement("summary");
+          const label = document.createElement("span");
+          label.className = "folder-name";
+          label.textContent = name;
+          summary.appendChild(label);
+          details.appendChild(summary);
+          renderNode(node.folders[name], details, depth + 1);
+          container.appendChild(details);
+        }
+        for (const file of node.files.sort((a, b) => a.name.localeCompare(b.name))) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = `file${file.path === selectedPath ? " active" : ""}`;
+          button.style.setProperty("--depth", depth);
+          button.title = file.path;
+          const [klass, glyph] = iconInfo(file.path);
+          button.innerHTML = `<span class="icon ${klass}">${glyph}</span><span class="file-label"></span>`;
+          button.querySelector(".file-label").textContent = file.name;
+          button.addEventListener("click", () => selectFile(file.path));
+          container.appendChild(button);
+        }
+      }
+
+      function renderTree() {
+        tree.replaceChildren();
+        const paths = Object.keys(files).sort();
+        if (!paths.length) {
+          const empty = document.createElement("div");
+          empty.id = "empty";
+          empty.textContent = "Waiting for generated files…";
+          tree.appendChild(empty);
+          return;
+        }
+        renderNode(buildTree(paths), tree, 0);
+      }
+
+      function modelFor(path) {
+        if (!editor || !window.monaco) return null;
+        const content = files[path] || "";
+        let model = models.get(path);
+        if (!model) {
+          model = monaco.editor.createModel(content, languageFor(path), monaco.Uri.parse(`inmemory://manimflow/${encodeURI(path)}`));
+          models.set(path, model);
+        } else if (model.getValue() !== content) {
+          model.setValue(content);
+        }
+        return model;
+      }
+
+      function selectFile(path) {
+        if (!path || !(path in files)) return;
+        selectedPath = path;
+        sessionStorage.setItem("manimflow.code.selected", path);
+        const [klass, glyph] = iconInfo(path);
+        const tabIcon = document.getElementById("tab-icon");
+        tabIcon.className = `icon ${klass}`;
+        tabIcon.textContent = glyph;
+        document.getElementById("tab-name").textContent = path;
+        fallback.textContent = files[path] || "";
+        if (editor) editor.setModel(modelFor(path));
+        renderTree();
       }
 
       function update(nextFiles) {
         files = nextFiles || {};
         const paths = Object.keys(files).sort();
-        const previous = sessionStorage.getItem("manimflow.code.selected");
-        const selected = paths.includes(previous) ? previous : (paths.includes("scene.py") ? "scene.py" : paths[0]);
-        select.replaceChildren(...paths.map(path => {
-          const option = document.createElement("option");
-          option.value = path;
-          option.textContent = path;
-          option.selected = path === selected;
-          return option;
-        }));
-        document.getElementById("status").textContent = `${paths.length} file${paths.length === 1 ? "" : "s"} · Read only`;
-        show(selected);
+        for (const [path, model] of models) {
+          if (!(path in files)) { model.dispose(); models.delete(path); }
+          else if (model.getValue() !== files[path]) model.setValue(files[path]);
+        }
+        const remembered = sessionStorage.getItem("manimflow.code.selected");
+        const next = paths.includes(selectedPath) ? selectedPath : paths.includes(remembered) ? remembered : paths.includes("scene.py") ? "scene.py" : paths[0];
+        document.getElementById("status").textContent = `${paths.length} file${paths.length === 1 ? "" : "s"} · UTF-8`;
+        renderTree();
+        if (next) selectFile(next);
       }
 
-      select.addEventListener("change", () => show(select.value));
       window.addEventListener("message", event => {
         const message = event.data || {};
         if (message.type === "streamlit:render") update(message.args?.files || {});
@@ -74,24 +172,17 @@
         require.config({ paths: { vs: "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs" } });
         require(["vs/editor/editor.main"], () => {
           editor = monaco.editor.create(document.getElementById("editor"), {
-            value: "",
-            language: "plaintext",
-            theme: "vs-dark",
-            readOnly: true,
-            domReadOnly: true,
-            automaticLayout: true,
-            minimap: { enabled: true },
-            fontSize: 13,
-            scrollBeyondLastLine: false,
-            wordWrap: "off"
+            theme: "vs-dark", readOnly: true, domReadOnly: true, automaticLayout: true,
+            minimap: { enabled: true }, fontSize: 13, scrollBeyondLastLine: false,
+            renderWhitespace: "selection", smoothScrolling: true
           });
+          fallback.style.display = "none";
           update(files);
         }, () => { fallback.style.display = "block"; update(files); });
-      } else {
-        fallback.style.display = "block";
-      }
+      } else fallback.style.display = "block";
+
       send("streamlit:componentReady", { apiVersion: 1 });
-      send("streamlit:setFrameHeight", { height: 520 });
+      send("streamlit:setFrameHeight", { height: 560 });
     </script>
   </body>
 </html>
