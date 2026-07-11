@@ -33,6 +33,11 @@ GITHUB_CLIENT_ID = "8b76dd0df855d8bc7db1"
 COPILOT_BASE = "https://api.individual.githubcopilot.com"
 COPILOT_MODEL = os.environ.get("COPILOT_MODEL", "gpt-4o")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+EXA_ENDPOINT = os.environ.get(
+    "EXA_ENDPOINT", "https://demos.exa.ai/chatbot-demo/api/chat/stream"
+)
+EXA_MODEL = os.environ.get("EXA_MODEL", "google/gemini-2.5-flash")
+EXA_EXTENSION = APP_DIR / "pi_extensions" / "exa_direct.ts"
 PI_PROVIDER = "manimflow-copilot"
 PI_TOKEN_ENV = "MANIMFLOW_COPILOT_TOKEN"
 
@@ -164,6 +169,102 @@ def gemini_chat(api_key, messages, log_queue=None):
     raise RuntimeError("Gemini planner exhausted its retry attempts.")
 
 
+def messages_to_exa_prompt(messages):
+    return "\n\n".join(
+        [
+            "You are called by ManimFlow.",
+            "Follow the latest SYSTEM and USER instructions exactly.",
+            "When asked for JSON, output exactly one strict JSON object and nothing else.",
+            "Do not wrap JSON in markdown fences.",
+            *[
+                f"{str(message.get('role', 'user')).upper()}:\n{message.get('content', '')}"
+                for message in messages
+            ],
+        ]
+    )
+
+
+def parse_exa_stream(raw):
+    text = ""
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("data:"):
+            continue
+        payload = stripped[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event.get("content"), str):
+            text += event["content"]
+    if not text and raw.strip() and "data:" not in raw:
+        try:
+            response = json.loads(raw)
+            text = (
+                response.get("text")
+                or response.get("response")
+                or response.get("content")
+                or response.get("choices", [{}])[0].get("message", {}).get("content")
+                or ""
+            )
+        except json.JSONDecodeError:
+            text = raw.strip()
+    return text
+
+
+def clean_exa_text(text):
+    cleaned = re.sub(r"```followups[\s\S]*?```", "", str(text), flags=re.I)
+    cleaned = re.sub(r"```followups[\s\S]*$", "", cleaned, flags=re.I).strip()
+    if not cleaned.startswith("{"):
+        return cleaned
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, character in enumerate(cleaned):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return cleaned[: index + 1]
+    return cleaned
+
+
+def exa_chat(messages, log_queue=None):
+    payload = json.dumps(
+        {
+            "message": messages_to_exa_prompt(messages),
+            "history": [],
+            "exaEnabled": False,
+            "model": EXA_MODEL,
+            "searchType": "instant",
+        }
+    ).encode()
+    request = urllib.request.Request(
+        EXA_ENDPOINT,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=180) as response:
+        raw = response.read().decode("utf-8", errors="replace")
+    result = clean_exa_text(parse_exa_stream(raw))
+    if not result:
+        raise RuntimeError("Exa returned no planner content.")
+    return result
+
+
 def node_major(node_command):
     try:
         version = subprocess.check_output(
@@ -238,7 +339,7 @@ def resolve_pi_command(log_queue):
         return str(runtime_pi)
 
 
-def write_pi_config(agent_dir):
+def write_pi_config(agent_dir, provider):
     agent_dir.mkdir(parents=True, exist_ok=True)
     models = {
         "providers": {
@@ -279,6 +380,12 @@ def write_pi_config(agent_dir):
     (agent_dir / "settings.json").write_text(
         json.dumps({"telemetry": False, "quietStartup": True}, indent=2)
     )
+    if provider == "exa":
+        if not EXA_EXTENSION.is_file():
+            raise RuntimeError(f"Exa Pi extension is missing: {EXA_EXTENSION}")
+        extensions_dir = agent_dir / "extensions"
+        extensions_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(EXA_EXTENSION, extensions_dir / "exa_direct.ts")
 
 
 def ensure_manim_docs(log_queue):
@@ -552,7 +659,11 @@ def _run_render(provider, credential, user_prompt, log_queue):
     workspace = run_dir / "project"
     agent_dir = run_dir / "pi-agent"
     workspace.mkdir()
-    provider_display = "Gemini" if provider == "gemini" else "Copilot"
+    provider_display = {
+        "gemini": "Gemini",
+        "exa": "Exa",
+        "copilot": "Copilot",
+    }[provider]
 
     try:
         pi_command = resolve_pi_command(log_queue)
@@ -579,6 +690,10 @@ def _run_render(provider, credential, user_prompt, log_queue):
             plan = gemini_chat(credential, planner_messages, log_queue)
             pi_provider = "google"
             pi_model = GEMINI_MODEL
+        elif provider == "exa":
+            plan = exa_chat(planner_messages, log_queue)
+            pi_provider = "exa-direct"
+            pi_model = EXA_MODEL
         else:
             plan = copilot_chat(credential, planner_messages, log_queue)
             pi_provider = PI_PROVIDER
@@ -586,12 +701,12 @@ def _run_render(provider, credential, user_prompt, log_queue):
         log_queue.put(("plan", plan))
 
         write_project_files(workspace, user_prompt, plan)
-        write_pi_config(agent_dir)
+        write_pi_config(agent_dir, provider)
 
         env = os.environ.copy()
         if provider == "gemini":
             env["GEMINI_API_KEY"] = credential
-        else:
+        elif provider == "copilot":
             env[PI_TOKEN_ENV] = credential
         env["PI_CODING_AGENT_DIR"] = str(agent_dir)
         env["PI_TELEMETRY"] = "0"
@@ -655,7 +770,6 @@ def _run_render(provider, credential, user_prompt, log_queue):
             "--verbose",
             "--approve",
             "--no-session",
-            "--no-extensions",
             "--no-skills",
             "--provider",
             pi_provider,
@@ -665,6 +779,8 @@ def _run_render(provider, credential, user_prompt, log_queue):
             "medium" if provider == "gemini" else "off",
             "@plan.md",
         ]
+        if provider != "exa":
+            command_prefix.insert(7, "--no-extensions")
         observed_doc_reads = set()
         video = None
         max_attempts = 4
@@ -778,10 +894,14 @@ st.caption("Describe an animation topic → get a rendered MP4")
 
 provider_label = st.radio(
     "Model provider",
-    ["GitHub Copilot", "Google Gemini"],
+    ["GitHub Copilot", "Google Gemini", "Exa"],
     horizontal=True,
 )
-selected_provider = "gemini" if provider_label == "Google Gemini" else "copilot"
+selected_provider = {
+    "GitHub Copilot": "copilot",
+    "Google Gemini": "gemini",
+    "Exa": "exa",
+}[provider_label]
 
 configured_copilot_token = deployment_token()
 if configured_copilot_token:
@@ -839,6 +959,10 @@ with st.sidebar:
         st.success("Connected to Google Gemini")
         st.caption(f"Agent: Pi · Model: {GEMINI_MODEL}")
         st.caption("Using GEMINI_API_KEY from Streamlit Secrets.")
+    elif selected_provider == "exa":
+        st.success("Connected to Exa")
+        st.caption(f"Agent: Pi · Model: {EXA_MODEL}")
+        st.caption("Using Exa's public endpoint; no API key required.")
     else:
         st.success("Connected to GitHub Copilot")
         st.caption(f"Agent: Pi · Model: {COPILOT_MODEL}")
@@ -863,7 +987,13 @@ if generate and prompt.strip():
     logs = []
     last_log_render = 0.0
     events = queue.Queue()
-    credential = gemini_key if selected_provider == "gemini" else st.session_state.copilot_token
+    credential = (
+        gemini_key
+        if selected_provider == "gemini"
+        else st.session_state.copilot_token
+        if selected_provider == "copilot"
+        else None
+    )
     thread = threading.Thread(
         target=run_render,
         args=(selected_provider, credential, prompt.strip(), events),
