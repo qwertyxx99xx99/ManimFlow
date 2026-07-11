@@ -376,8 +376,9 @@ def canonical_doc_path(value, workspace):
     relative = marker + normalized.split(marker, 1)[1]
     relative = relative.rstrip(".,;:)]}`'").replace("//", "/")
     candidate = workspace / relative
+    workspace_docs = (workspace / "manim-docs").resolve()
     try:
-        if candidate.is_file() and candidate.resolve().is_relative_to(MANIM_DOCS_REPO.resolve()):
+        if candidate.is_file() and candidate.resolve().is_relative_to(workspace_docs):
             return relative
     except (OSError, ValueError):
         return None
@@ -533,7 +534,11 @@ def _run_render(provider, credential, user_prompt, log_queue):
     try:
         pi_command = resolve_pi_command(log_queue)
         docs_dir = ensure_manim_docs(log_queue)
-        (workspace / "manim-docs").symlink_to(docs_dir, target_is_directory=True)
+        shutil.copytree(
+            docs_dir,
+            workspace / "manim-docs",
+            copy_function=os.link,
+        )
 
         log_queue.put(("log", "Planning scenes..."))
         planner_messages = [
