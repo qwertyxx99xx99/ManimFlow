@@ -44,7 +44,7 @@ GITHUB_CLIENT_ID = "8b76dd0df855d8bc7db1"
 COPILOT_BASE = "https://api.individual.githubcopilot.com"
 COPILOT_MODEL = os.environ.get("COPILOT_MODEL", "gpt-4o")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")
 EXA_ENDPOINT = os.environ.get(
     "EXA_ENDPOINT", "https://demos.exa.ai/chatbot-demo/api/chat/stream"
 )
