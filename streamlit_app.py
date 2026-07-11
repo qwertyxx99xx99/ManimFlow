@@ -32,6 +32,7 @@ _RENDER_SEMAPHORE = threading.Semaphore(1)
 GITHUB_CLIENT_ID = "8b76dd0df855d8bc7db1"
 COPILOT_BASE = "https://api.individual.githubcopilot.com"
 COPILOT_MODEL = os.environ.get("COPILOT_MODEL", "gpt-4o")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 PI_PROVIDER = "manimflow-copilot"
 PI_TOKEN_ENV = "MANIMFLOW_COPILOT_TOKEN"
 
@@ -48,14 +49,18 @@ def request_device_code():
         return json.loads(response.read())
 
 
-def deployment_token():
+def secret_value(name):
     try:
-        value = st.secrets.get("COPILOT_TOKEN", "")
+        value = st.secrets.get(name, "")
         if value:
             return str(value)
     except Exception:
         pass
-    return os.environ.get("COPILOT_TOKEN", "").strip()
+    return os.environ.get(name, "").strip()
+
+
+def deployment_token():
+    return secret_value("COPILOT_TOKEN")
 
 
 def poll_token(device_code):
@@ -112,6 +117,51 @@ def copilot_chat(token, messages, log_queue=None):
                 )
             time.sleep(delay)
     raise RuntimeError("Copilot planner exhausted its retry attempts.")
+
+
+def gemini_chat(api_key, messages, log_queue=None):
+    system_text = "\n".join(
+        message["content"] for message in messages if message["role"] == "system"
+    )
+    user_text = "\n".join(
+        message["content"] for message in messages if message["role"] == "user"
+    )
+    payload = json.dumps(
+        {
+            "systemInstruction": {"parts": [{"text": system_text}]},
+            "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+        }
+    ).encode()
+    endpoint = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+        f"?key={urllib.parse.quote(api_key)}"
+    )
+    for attempt in range(5):
+        request = urllib.request.Request(
+            endpoint,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=180) as response:
+                body = json.loads(response.read())
+            parts = body["candidates"][0]["content"]["parts"]
+            return "".join(part.get("text", "") for part in parts).strip()
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 or attempt == 4:
+                raise
+            retry_after = exc.headers.get("Retry-After", "")
+            try:
+                delay = max(int(retry_after), 5 * (2**attempt))
+            except ValueError:
+                delay = 5 * (2**attempt)
+            delay = min(delay, 120)
+            if log_queue:
+                log_queue.put(
+                    ("log", f"Gemini rate limited the planner; retrying in {delay}s...")
+                )
+            time.sleep(delay)
+    raise RuntimeError("Gemini planner exhausted its retry attempts.")
 
 
 def node_major(node_command):
@@ -472,12 +522,13 @@ def concise_pi_event(line):
     return "\n".join(updates) or None
 
 
-def _run_render(token, user_prompt, log_queue):
+def _run_render(provider, credential, user_prompt, log_queue):
     clean_old_runs()
     run_dir = pathlib.Path(tempfile.mkdtemp(prefix="run-", dir=BASE))
     workspace = run_dir / "project"
     agent_dir = run_dir / "pi-agent"
     workspace.mkdir()
+    provider_display = "Gemini" if provider == "gemini" else "Copilot"
 
     try:
         pi_command = resolve_pi_command(log_queue)
@@ -485,28 +536,35 @@ def _run_render(token, user_prompt, log_queue):
         (workspace / "manim-docs").symlink_to(docs_dir, target_is_directory=True)
 
         log_queue.put(("log", "Planning scenes..."))
-        plan = copilot_chat(
-            token,
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a Manim animation planner. Output a plain numbered "
-                        "list of visual scenes with no markdown or commentary. Use 3-4 "
-                        "scenes for a short request, 5-6 by default, and 8-12 when detailed."
-                    ),
-                },
-                {"role": "user", "content": user_prompt},
-            ],
-            log_queue,
-        )
+        planner_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a Manim animation planner. Output a plain numbered "
+                    "list of visual scenes with no markdown or commentary. Use 3-4 "
+                    "scenes for a short request, 5-6 by default, and 8-12 when detailed."
+                ),
+            },
+            {"role": "user", "content": user_prompt},
+        ]
+        if provider == "gemini":
+            plan = gemini_chat(credential, planner_messages, log_queue)
+            pi_provider = "google"
+            pi_model = GEMINI_MODEL
+        else:
+            plan = copilot_chat(credential, planner_messages, log_queue)
+            pi_provider = PI_PROVIDER
+            pi_model = COPILOT_MODEL
         log_queue.put(("plan", plan))
 
         write_project_files(workspace, user_prompt, plan)
         write_pi_config(agent_dir)
 
         env = os.environ.copy()
-        env[PI_TOKEN_ENV] = token
+        if provider == "gemini":
+            env["GEMINI_API_KEY"] = credential
+        else:
+            env[PI_TOKEN_ENV] = credential
         env["PI_CODING_AGENT_DIR"] = str(agent_dir)
         env["PI_TELEMETRY"] = "0"
         env["PATH"] = f"{pathlib.Path(sys.executable).parent}:{env.get('PATH', '')}"
@@ -534,7 +592,7 @@ def _run_render(token, user_prompt, log_queue):
 
         try:
             model_check = subprocess.run(
-                [pi_command, "--list-models", PI_PROVIDER],
+                [pi_command, "--list-models", pi_provider],
                 cwd=str(workspace),
                 env=env,
                 stdin=subprocess.DEVNULL,
@@ -548,12 +606,12 @@ def _run_render(token, user_prompt, log_queue):
         except subprocess.CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
             raise RuntimeError(f"Pi model preflight failed: {detail}") from exc
-        if COPILOT_MODEL not in model_check.stdout:
+        if pi_model not in model_check.stdout:
             raise RuntimeError(
-                f"Pi cannot see {PI_PROVIDER}/{COPILOT_MODEL}. Output: "
+                f"Pi cannot see {pi_provider}/{pi_model}. Output: "
                 f"{model_check.stdout.strip() or '(empty)'}"
             )
-        log_queue.put(("log", f"Pi model ready → {PI_PROVIDER}/{COPILOT_MODEL}"))
+        log_queue.put(("log", f"Pi model ready → {pi_provider}/{pi_model}"))
 
         task = (
             "First satisfy the mandatory documentation gate in AGENTS.md using only the "
@@ -572,9 +630,9 @@ def _run_render(token, user_prompt, log_queue):
             "--no-extensions",
             "--no-skills",
             "--provider",
-            PI_PROVIDER,
+            pi_provider,
             "--model",
-            COPILOT_MODEL,
+            pi_model,
             "--thinking",
             "off",
             "@plan.md",
@@ -642,7 +700,10 @@ def _run_render(token, user_prompt, log_queue):
                 if rate_limited:
                     delay = min(30 * attempt, 120)
                     log_queue.put(
-                        ("log", f"Copilot rate limited Pi; waiting {delay}s before continuation...")
+                        (
+                            "log",
+                            f"{provider_display} rate limited Pi; waiting {delay}s before continuation...",
+                        )
                     )
                     time.sleep(delay)
                 log_queue.put(
@@ -671,7 +732,7 @@ def _run_render(token, user_prompt, log_queue):
         log_queue.put(("error", str(exc)))
 
 
-def run_render(token, user_prompt, log_queue):
+def run_render(provider, credential, user_prompt, log_queue):
     if not _RENDER_SEMAPHORE.acquire(blocking=False):
         log_queue.put(
             ("log", "Another animation is currently rendering; this request is queued.")
@@ -679,7 +740,7 @@ def run_render(token, user_prompt, log_queue):
         _RENDER_SEMAPHORE.acquire()
         log_queue.put(("log", "Render slot available; starting this request."))
     try:
-        _run_render(token, user_prompt, log_queue)
+        _run_render(provider, credential, user_prompt, log_queue)
     finally:
         _RENDER_SEMAPHORE.release()
 
@@ -688,12 +749,29 @@ st.set_page_config(page_title="ManimFlow", layout="wide")
 st.title("ManimFlow")
 st.caption("Describe an animation topic → get a rendered MP4")
 
+provider_label = st.radio(
+    "Model provider",
+    ["GitHub Copilot", "Google Gemini"],
+    horizontal=True,
+)
+selected_provider = "gemini" if provider_label == "Google Gemini" else "copilot"
+
 if "copilot_token" not in st.session_state:
     st.session_state.copilot_token = deployment_token() or None
 if "device_flow" not in st.session_state:
     st.session_state.device_flow = None
 
-if not st.session_state.copilot_token:
+gemini_key = secret_value("GEMINI_API_KEY")
+
+if selected_provider == "gemini" and not gemini_key:
+    st.error(
+        "Google Gemini is selected, but GEMINI_API_KEY is missing. Add it under "
+        "Streamlit App settings → Secrets before generating."
+    )
+    st.code('GEMINI_API_KEY = "your-key"', language="toml")
+    st.stop()
+
+if selected_provider == "copilot" and not st.session_state.copilot_token:
     st.info("Login with GitHub to use your Copilot subscription for rendering.")
     if st.session_state.device_flow is None:
         if st.button("Login with GitHub Copilot", type="primary"):
@@ -727,14 +805,19 @@ Then continue after authorizing ManimFlow.
     st.stop()
 
 with st.sidebar:
-    st.success("Connected to GitHub Copilot")
-    st.caption(f"Agent: Pi · Model: {COPILOT_MODEL}")
-    if deployment_token():
-        st.caption("Using the deployment's Streamlit secret.")
-    elif st.button("Logout"):
-        st.session_state.copilot_token = None
-        st.session_state.device_flow = None
-        st.rerun()
+    if selected_provider == "gemini":
+        st.success("Connected to Google Gemini")
+        st.caption(f"Agent: Pi · Model: {GEMINI_MODEL}")
+        st.caption("Using GEMINI_API_KEY from Streamlit Secrets.")
+    else:
+        st.success("Connected to GitHub Copilot")
+        st.caption(f"Agent: Pi · Model: {COPILOT_MODEL}")
+        if deployment_token():
+            st.caption("Using the deployment's Streamlit secret.")
+        elif st.button("Logout"):
+            st.session_state.copilot_token = None
+            st.session_state.device_flow = None
+            st.rerun()
 
 prompt = st.text_area(
     "Animation prompt",
@@ -750,9 +833,10 @@ if generate and prompt.strip():
     logs = []
     last_log_render = 0.0
     events = queue.Queue()
+    credential = gemini_key if selected_provider == "gemini" else st.session_state.copilot_token
     thread = threading.Thread(
         target=run_render,
-        args=(st.session_state.copilot_token, prompt.strip(), events),
+        args=(selected_provider, credential, prompt.strip(), events),
         daemon=True,
     )
     thread.start()

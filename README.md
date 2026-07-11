@@ -30,6 +30,7 @@ For Streamlit Community Cloud:
 
    ```toml
    COPILOT_TOKEN = "your-token"
+   GEMINI_API_KEY = "your-gemini-key"
    ```
 
 3. Deploy. The app installs the pinned Pi version and an isolated Node 22 runtime
@@ -38,6 +39,8 @@ For Streamlit Community Cloud:
 If `COPILOT_TOKEN` is omitted, the app shows GitHub's device-login flow instead.
 The token is kept in Streamlit session state, passed to Pi through its subprocess
 environment, and is never placed in the URL or written to Pi's auth file.
+Selecting Google Gemini requires `GEMINI_API_KEY`; generation is disabled when it
+is missing. Gemini uses `gemini-2.5-flash` for both planning and the Pi agent.
 
 Local development:
 
