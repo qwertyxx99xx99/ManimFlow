@@ -931,7 +931,12 @@ def validate_documentation_gate(workspace, observed_reads):
             "Pi skipped the documentation gate: docs_consulted.md is missing or incomplete."
         )
     content = evidence.read_text(errors="replace")
-    cited_values = re.findall(r"manim-docs/[A-Za-z0-9_./-]+", content)
+    # Match actual documentation files, not prose such as "search under
+    # manim-docs/source/". Treating that directory prefix as a citation caused
+    # successful renders to fail the gate even when three real files were read.
+    cited_values = re.findall(
+        r"manim-docs/[A-Za-z0-9_./-]+\.(?:rst|md)\b", content, flags=re.IGNORECASE
+    )
     if not cited_values:
         raise RuntimeError(
             "Pi's docs_consulted.md does not cite exact paths from the local Manim docs."
