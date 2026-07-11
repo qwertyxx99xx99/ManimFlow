@@ -440,21 +440,26 @@ def ensure_manim_docs(log_queue):
         return docs_dir
 
 
-def write_project_files(workspace, user_prompt, plan):
+def write_project_files(workspace, user_prompt, plan, require_docs=True):
     render_command = f'"{sys.executable}" -m manim -pql --disable_caching scene.py AnimScene'
     (workspace / "plan.md").write_text(
         f"# Animation Plan\n\n## Original request\n{user_prompt}\n\n## Scenes\n{plan}\n"
     )
-    (workspace / "AGENTS.md").write_text(
-        "You are an autonomous coding agent building a Manim animation.\n"
-        "Read plan.md before editing. Work without asking questions.\n"
+    documentation_gate = (
         "MANDATORY DOCUMENTATION GATE — complete this before writing any Python:\n"
         "1. Identify every Manim class, animation, object, layout helper, and renderer feature you plan to use.\n"
         "2. Search only manim-docs/source/ with focused commands such as `rg -l 'Pattern' manim-docs/source`. Do not search manim-docs/i18n, do not dump broad match output, and do not use the web.\n"
         "3. Use Pi's read tool (not only grep/cat) to read the relevant local documentation for every planned part. Read at least three distinct relevant documentation files.\n"
         "4. Create docs_consulted.md before any .py file. For each planned API, record the exact manim-docs/ path actually read and the key constraint or usage learned. Cite no file you did not read with the read tool.\n"
         "Do not start implementation until docs_consulted.md is complete.\n"
-        "Create helper modules first and scene.py last.\n"
+        if require_docs
+        else "Documentation reading is optional. Start implementation immediately and do not create docs_consulted.md unless it is genuinely useful.\n"
+    )
+    (workspace / "AGENTS.md").write_text(
+        "You are an autonomous coding agent building a Manim animation.\n"
+        "Read plan.md before editing. Work without asking questions.\n"
+        + documentation_gate
+        + "Create helper modules first and scene.py last.\n"
         "Every Python file must start with: from manim import *\n"
         "scene.py must define AnimScene(Scene).\n"
         "Use MathTex(r'...') for equations and Text() for plain labels.\n"
@@ -667,12 +672,13 @@ def _run_render(provider, credential, user_prompt, log_queue):
 
     try:
         pi_command = resolve_pi_command(log_queue)
-        docs_dir = ensure_manim_docs(log_queue)
-        shutil.copytree(
-            docs_dir,
-            workspace / "manim-docs",
-            copy_function=os.link,
-        )
+        if provider != "exa":
+            docs_dir = ensure_manim_docs(log_queue)
+            shutil.copytree(
+                docs_dir,
+                workspace / "manim-docs",
+                copy_function=os.link,
+            )
 
         log_queue.put(("log", "Planning scenes..."))
         planner_messages = [
@@ -700,7 +706,7 @@ def _run_render(provider, credential, user_prompt, log_queue):
             pi_model = COPILOT_MODEL
         log_queue.put(("plan", plan))
 
-        write_project_files(workspace, user_prompt, plan)
+        write_project_files(workspace, user_prompt, plan, require_docs=provider != "exa")
         write_pi_config(agent_dir, provider)
 
         env = os.environ.copy()
@@ -756,13 +762,20 @@ def _run_render(provider, credential, user_prompt, log_queue):
             )
         log_queue.put(("log", f"Pi model ready → {pi_provider}/{pi_model}"))
 
-        task = (
-            "First satisfy the mandatory documentation gate in AGENTS.md using only the "
-            "local manim-docs/ checkout. Then implement the complete animation described "
-            "in plan.md. Use your file and "
-            "bash tools autonomously. Run the Manim test after edits, diagnose failures, "
-            "and keep repairing until it renders successfully. Do not ask questions."
-        )
+        if provider == "exa":
+            task = (
+                "Implement the complete animation described in plan.md immediately. Use your "
+                "file and bash tools autonomously. Run the Manim test after edits, diagnose "
+                "failures, and keep repairing until it renders successfully. Do not ask questions."
+            )
+        else:
+            task = (
+                "First satisfy the mandatory documentation gate in AGENTS.md using only the "
+                "local manim-docs/ checkout. Then implement the complete animation described "
+                "in plan.md. Use your file and bash tools autonomously. Run the Manim test after "
+                "edits, diagnose failures, and keep repairing until it renders successfully. "
+                "Do not ask questions."
+            )
         command_prefix = [
             pi_command,
             "--mode",
@@ -820,7 +833,8 @@ def _run_render(provider, credential, user_prompt, log_queue):
                     output_started = True
                     if is_rate_limit_event(output_line):
                         rate_limited = True
-                    observe_documentation_read(output_line, workspace, observed_doc_reads)
+                    if provider != "exa":
+                        observe_documentation_read(output_line, workspace, observed_doc_reads)
                     update = concise_pi_event(output_line)
                     if update:
                         log_queue.put(("log", update))
@@ -859,10 +873,11 @@ def _run_render(provider, credential, user_prompt, log_queue):
                     "all failures, and verify that a non-empty MP4 exists before stopping."
                 )
 
-        validate_documentation_gate(workspace, observed_doc_reads)
-        log_queue.put(
-            ("log", f"Documentation gate passed → {len(observed_doc_reads)} distinct files read")
-        )
+        if provider != "exa":
+            validate_documentation_gate(workspace, observed_doc_reads)
+            log_queue.put(
+                ("log", f"Documentation gate passed → {len(observed_doc_reads)} distinct files read")
+            )
         if video is None:
             raise RuntimeError(
                 f"Pi did not produce a valid MP4 after {max_attempts} autonomous attempts."
