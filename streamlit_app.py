@@ -388,13 +388,24 @@ def write_pi_config(agent_dir, provider):
         shutil.copy2(EXA_EXTENSION, extensions_dir / "exa_direct.ts")
 
 
+def prune_manim_docs(docs_dir):
+    shutil.rmtree(docs_dir / "source" / "changelog", ignore_errors=True)
+    changelog_index = docs_dir / "source" / "changelog.rst"
+    try:
+        changelog_index.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def ensure_manim_docs(log_queue):
     docs_dir = MANIM_DOCS_REPO / "docs"
     if docs_dir.is_dir():
+        prune_manim_docs(docs_dir)
         return docs_dir
 
     with _MANIM_DOCS_LOCK:
         if docs_dir.is_dir():
+            prune_manim_docs(docs_dir)
             return docs_dir
 
         log_queue.put(("log", "Cloning Manim documentation (shallow, docs only)..."))
@@ -430,6 +441,7 @@ def ensure_manim_docs(log_queue):
             if MANIM_DOCS_REPO.exists():
                 shutil.rmtree(MANIM_DOCS_REPO)
             staging_repo.rename(MANIM_DOCS_REPO)
+            prune_manim_docs(docs_dir)
         except subprocess.CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
             raise RuntimeError(f"Unable to clone Manim documentation: {detail}") from exc
