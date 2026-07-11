@@ -36,6 +36,8 @@ function contextToPrompt(context: Context): string {
     "When asked for JSON, output exactly one strict JSON object and nothing else.",
     "Do not wrap JSON in markdown fences.",
     "To use a tool, output exactly one JSON object in this form: {\"tool\":\"tool_name\",\"arguments\":{...}}.",
+    "For the write tool, arguments MUST be ordered as path first and content second: {\"tool\":\"write\",\"arguments\":{\"path\":\"file.py\",\"content\":\"...\"}}.",
+    "Keep each file small and focused. Prefer multiple helper files over one write whose content exceeds 4000 characters.",
     "Never describe a tool call or place it in a markdown fence.",
   ];
 
@@ -65,8 +67,23 @@ function parseToolRequest(text: string, context: Context) {
     const commandMatch = candidate.match(
       /"command"\s*:\s*"([\s\S]*)"\s*\}\s*\}\s*$/,
     );
-    if (!toolMatch || !commandMatch) return null;
-    value = { tool: toolMatch[1], arguments: { command: commandMatch[1] } };
+    if (toolMatch?.[1] === "bash" && commandMatch) {
+      value = { tool: "bash", arguments: { command: commandMatch[1] } };
+    } else if (toolMatch?.[1] === "write") {
+      const pathMatch = candidate.match(/"path"\s*:\s*"((?:\\.|[^"\\])*)"/);
+      const contentStart = candidate.match(/"content"\s*:\s*"/);
+      if (!pathMatch || !contentStart || contentStart.index === undefined) return null;
+      const rawContent = candidate.slice(contentStart.index + contentStart[0].length);
+      value = {
+        tool: "write",
+        arguments: {
+          path: decodePartialJsonString(pathMatch[1]),
+          content: decodePartialJsonString(rawContent),
+        },
+      };
+    } else {
+      return null;
+    }
   }
 
   const name = value?.tool || value?.name;
@@ -75,6 +92,36 @@ function parseToolRequest(text: string, context: Context) {
     return null;
   if (!context.tools?.some((tool: any) => tool.name === name)) return null;
   return { name, arguments: args };
+}
+
+function decodePartialJsonString(raw: string): string {
+  let result = "";
+  let escaped = false;
+  for (let index = 0; index < raw.length; index++) {
+    const character = raw[index];
+    if (!escaped) {
+      if (character === "\\") {
+        escaped = true;
+      } else if (character === '"' && /^\s*[,}]/.test(raw.slice(index + 1))) {
+        break;
+      } else {
+        result += character;
+      }
+      continue;
+    }
+    escaped = false;
+    if (character === "n") result += "\n";
+    else if (character === "r") result += "\r";
+    else if (character === "t") result += "\t";
+    else if (character === "b") result += "\b";
+    else if (character === "f") result += "\f";
+    else if (character === "u" && /^[0-9a-fA-F]{4}/.test(raw.slice(index + 1, index + 5))) {
+      result += String.fromCharCode(parseInt(raw.slice(index + 1, index + 5), 16));
+      index += 4;
+    } else result += character;
+  }
+  if (escaped) result += "\\";
+  return result;
 }
 
 function parseExaStream(raw: string): string {
