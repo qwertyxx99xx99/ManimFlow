@@ -22,6 +22,9 @@ RUNTIME_DIR = pathlib.Path("/tmp/manimflow_pi_runtime")
 NODE_DIR = pathlib.Path("/tmp/manimflow_node")
 PI_VERSION = "0.80.6"
 _PI_INSTALL_LOCK = threading.Lock()
+MANIM_DOCS_REPO = pathlib.Path("/tmp/manim_community_docs")
+MANIM_DOCS_URL = "https://github.com/ManimCommunity/manim.git"
+_MANIM_DOCS_LOCK = threading.Lock()
 
 GITHUB_CLIENT_ID = "8b76dd0df855d8bc7db1"
 COPILOT_BASE = "https://api.individual.githubcopilot.com"
@@ -208,6 +211,58 @@ def write_pi_config(agent_dir):
     )
 
 
+def ensure_manim_docs(log_queue):
+    docs_dir = MANIM_DOCS_REPO / "docs"
+    if docs_dir.is_dir():
+        return docs_dir
+
+    with _MANIM_DOCS_LOCK:
+        if docs_dir.is_dir():
+            return docs_dir
+
+        log_queue.put(("log", "Cloning Manim documentation (shallow, docs only)..."))
+        staging_root = pathlib.Path(tempfile.mkdtemp(prefix="manim-docs-", dir="/tmp"))
+        staging_repo = staging_root / "repo"
+        try:
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "--filter=blob:none",
+                    "--sparse",
+                    MANIM_DOCS_URL,
+                    str(staging_repo),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            subprocess.run(
+                ["git", "sparse-checkout", "set", "docs"],
+                cwd=str(staging_repo),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if not (staging_repo / "docs").is_dir():
+                raise RuntimeError("The Manim repository did not contain docs/.")
+            if MANIM_DOCS_REPO.exists():
+                shutil.rmtree(MANIM_DOCS_REPO)
+            staging_repo.rename(MANIM_DOCS_REPO)
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()
+            raise RuntimeError(f"Unable to clone Manim documentation: {detail}") from exc
+        finally:
+            shutil.rmtree(staging_root, ignore_errors=True)
+
+        log_queue.put(("log", f"Manim documentation ready → {docs_dir}"))
+        return docs_dir
+
+
 def write_project_files(workspace, user_prompt, plan):
     render_command = f'"{sys.executable}" -m manim -pql --disable_caching scene.py AnimScene'
     (workspace / "plan.md").write_text(
@@ -216,6 +271,12 @@ def write_project_files(workspace, user_prompt, plan):
     (workspace / "AGENTS.md").write_text(
         "You are an autonomous coding agent building a Manim animation.\n"
         "Read plan.md before editing. Work without asking questions.\n"
+        "MANDATORY DOCUMENTATION GATE — complete this before writing any Python:\n"
+        "1. Identify every Manim class, animation, object, layout helper, and renderer feature you plan to use.\n"
+        "2. Search the local manim-docs/ tree with command-line tools such as rg and find. Do not use the web.\n"
+        "3. Read the relevant local documentation for every planned part.\n"
+        "4. Create docs_consulted.md before any .py file. For each planned API, record the exact manim-docs/ path read and the key constraint or usage learned.\n"
+        "Do not start implementation until docs_consulted.md is complete.\n"
         "Create helper modules first and scene.py last.\n"
         "Every Python file must start with: from manim import *\n"
         "scene.py must define AnimScene(Scene).\n"
@@ -235,6 +296,24 @@ def newest_video(workspace):
         if path.is_file() and path.stat().st_size > 50_000
     ]
     return max(videos, key=lambda path: path.stat().st_mtime) if videos else None
+
+
+def validate_documentation_gate(workspace):
+    evidence = workspace / "docs_consulted.md"
+    if not evidence.is_file() or evidence.stat().st_size < 200:
+        raise RuntimeError(
+            "Pi skipped the documentation gate: docs_consulted.md is missing or incomplete."
+        )
+    content = evidence.read_text(errors="replace")
+    if "manim-docs/" not in content:
+        raise RuntimeError(
+            "Pi's docs_consulted.md does not cite exact paths from the local Manim docs."
+        )
+    python_files = list(workspace.glob("*.py"))
+    if python_files and evidence.stat().st_mtime > min(path.stat().st_mtime for path in python_files):
+        raise RuntimeError(
+            "Pi wrote Python before completing docs_consulted.md; documentation gate failed."
+        )
 
 
 def clean_old_runs(max_age_seconds=6 * 60 * 60):
@@ -327,6 +406,8 @@ def run_render(token, user_prompt, log_queue):
 
     try:
         pi_command = resolve_pi_command(log_queue)
+        docs_dir = ensure_manim_docs(log_queue)
+        (workspace / "manim-docs").symlink_to(docs_dir, target_is_directory=True)
 
         log_queue.put(("log", "Planning scenes..."))
         plan = copilot_chat(
@@ -399,7 +480,9 @@ def run_render(token, user_prompt, log_queue):
         log_queue.put(("log", f"Pi model ready → {PI_PROVIDER}/{COPILOT_MODEL}"))
 
         task = (
-            "Implement the complete animation described in plan.md. Use your file and "
+            "First satisfy the mandatory documentation gate in AGENTS.md using only the "
+            "local manim-docs/ checkout. Then implement the complete animation described "
+            "in plan.md. Use your file and "
             "bash tools autonomously. Run the Manim test after edits, diagnose failures, "
             "and keep repairing until it renders successfully. Do not ask questions."
         )
@@ -466,6 +549,7 @@ def run_render(token, user_prompt, log_queue):
         return_code = process.wait()
         log_queue.put(("log", f"Pi exit code: {return_code}"))
 
+        validate_documentation_gate(workspace)
         video = newest_video(workspace)
         if video is None:
             raise RuntimeError("Pi did not produce a valid MP4 render.")
