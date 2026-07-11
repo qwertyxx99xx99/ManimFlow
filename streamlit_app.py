@@ -379,15 +379,16 @@ def run_render(token, user_prompt, log_queue):
             try:
                 output_line = raw_lines.get(timeout=1)
             except queue.Empty:
-                now = time.monotonic()
-                if now - last_heartbeat >= 15:
-                    elapsed = int(now - started_at)
-                    log_queue.put(("log", f"Pi is still working... ({elapsed}s elapsed)"))
-                    last_heartbeat = now
-                continue
-            update = concise_pi_event(output_line)
-            if update:
-                log_queue.put(("log", update))
+                output_line = None
+            if output_line is not None:
+                update = concise_pi_event(output_line)
+                if update:
+                    log_queue.put(("log", update))
+            now = time.monotonic()
+            if now - last_heartbeat >= 15:
+                elapsed = int(now - started_at)
+                log_queue.put(("log", f"Pi is still working... ({elapsed}s elapsed)"))
+                last_heartbeat = now
         reader.join(timeout=1)
         return_code = process.wait()
         log_queue.put(("log", f"Pi exit code: {return_code}"))
