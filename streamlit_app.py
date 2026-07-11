@@ -1421,6 +1421,7 @@ provider_label = st.radio(
         "Anthropic OAuth Token",
         "Exa",
     ],
+    index=4,
     horizontal=True,
 )
 selected_provider = {
