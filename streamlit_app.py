@@ -756,8 +756,11 @@ provider_label = st.radio(
 )
 selected_provider = "gemini" if provider_label == "Google Gemini" else "copilot"
 
-if "copilot_token" not in st.session_state:
-    st.session_state.copilot_token = deployment_token() or None
+configured_copilot_token = deployment_token()
+if configured_copilot_token:
+    st.session_state.copilot_token = configured_copilot_token
+elif "copilot_token" not in st.session_state:
+    st.session_state.copilot_token = None
 if "device_flow" not in st.session_state:
     st.session_state.device_flow = None
 
