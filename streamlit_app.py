@@ -3,6 +3,7 @@ import base64
 import hashlib
 import hmac
 import io
+import mimetypes
 import os
 import pathlib
 import queue
@@ -110,20 +111,41 @@ def browser_credential(action="get", value=None):
     )
 
 
-def workspace_code_snapshot(workspace, max_file_bytes=100_000, max_total_bytes=600_000):
+def workspace_code_snapshot(
+    workspace,
+    max_file_bytes=100_000,
+    max_total_bytes=600_000,
+    max_media_file_bytes=50_000_000,
+    max_media_total_bytes=100_000_000,
+):
     allowed_suffixes = {".py", ".md", ".toml", ".yaml", ".yml", ".json", ".txt"}
-    excluded_parts = {"manim-docs", "media", "__pycache__", ".git"}
+    media_suffixes = {".mp4", ".webm", ".mov", ".gif", ".png", ".jpg", ".jpeg", ".wav", ".mp3"}
+    excluded_parts = {"manim-docs", "partial_movie_files", "Tex", "texts", "__pycache__", ".git"}
     files = {}
     total = 0
+    media_total = 0
     for path in sorted(workspace.rglob("*")):
-        if not path.is_file() or path.suffix.lower() not in allowed_suffixes:
+        if not path.is_file():
             continue
         relative = path.relative_to(workspace)
         if any(part in excluded_parts or part.startswith(".") for part in relative.parts):
             continue
+        suffix = path.suffix.lower()
         try:
             size = path.stat().st_size
-            if size > max_file_bytes or total + size > max_total_bytes:
+            if suffix in media_suffixes:
+                if size <= 0 or size > max_media_file_bytes or media_total + size > max_media_total_bytes:
+                    continue
+                mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+                files[relative.as_posix()] = {
+                    "kind": "download",
+                    "mime": mime,
+                    "data": base64.b64encode(path.read_bytes()).decode("ascii"),
+                    "size": size,
+                }
+                media_total += size
+                continue
+            if suffix not in allowed_suffixes or size > max_file_bytes or total + size > max_total_bytes:
                 continue
             content = path.read_text(errors="replace")
         except OSError:
@@ -135,10 +157,15 @@ def workspace_code_snapshot(workspace, max_file_bytes=100_000, max_total_bytes=6
 
 def code_snapshot_signature(files):
     digest = hashlib.sha256()
-    for path, content in files.items():
+    for path, value in files.items():
         digest.update(path.encode())
         digest.update(b"\0")
-        digest.update(content.encode())
+        if isinstance(value, str):
+            digest.update(value.encode())
+        else:
+            digest.update(str(value.get("kind", "")).encode())
+            digest.update(str(value.get("size", 0)).encode())
+            digest.update(value.get("data", "").encode())
         digest.update(b"\0")
     return digest.hexdigest()
 

@@ -22,7 +22,7 @@
       .file.active { color: #ffffff; background: #37373d; }
       .file-label { overflow: hidden; text-overflow: ellipsis; }
       .icon { width: 15px; flex: 0 0 15px; text-align: center; font-size: 11px; font-weight: 700; }
-      .icon.py { color: #75beff; } .icon.md { color: #519aba; } .icon.json { color: #f1c40f; } .icon.config { color: #c586c0; } .icon.txt { color: #aaaaaa; }
+      .icon.py { color: #75beff; } .icon.md { color: #519aba; } .icon.json { color: #f1c40f; } .icon.config { color: #c586c0; } .icon.txt { color: #aaaaaa; } .icon.media { color: #c586c0; }
       #main { min-width: 0; display: grid; grid-template-rows: 35px 1fr 22px; }
       #tabs { background: #181818; display: flex; align-items: stretch; border-bottom: 1px solid #2b2b2b; overflow: hidden; }
       #tab { min-width: 145px; max-width: 300px; display: flex; align-items: center; gap: 7px; padding: 0 12px; background: #1e1e1e; border-top: 1px solid #007acc; color: #ffffff; font-size: 13px; }
@@ -58,9 +58,14 @@
       const models = new Map();
 
       function extension(path) { return (path.split(".").pop() || "").toLowerCase(); }
+      function entryFor(path) {
+        const value = files[path];
+        return value && typeof value === "object" ? value : { kind: "text", content: value || "" };
+      }
       function languageFor(path) { return ({ py: "python", md: "markdown", json: "json", toml: "ini", yaml: "yaml", yml: "yaml", txt: "plaintext" })[extension(path)] || "plaintext"; }
       function iconInfo(path) {
         const ext = extension(path);
+        if (["mp4", "webm", "mov", "gif", "png", "jpg", "jpeg", "wav", "mp3"].includes(ext)) return ["media", "⇩"];
         if (ext === "py") return ["py", "PY"];
         if (ext === "md") return ["md", "M↓"];
         if (ext === "json") return ["json", "{}"];
@@ -124,7 +129,7 @@
 
       function modelFor(path) {
         if (!editor || !window.monaco) return null;
-        const content = files[path] || "";
+        const content = entryFor(path).content || "";
         let model = models.get(path);
         if (!model) {
           model = monaco.editor.createModel(content, languageFor(path), monaco.Uri.parse(`inmemory://manimflow/${encodeURI(path)}`));
@@ -137,6 +142,16 @@
 
       function selectFile(path) {
         if (!path || !(path in files)) return;
+        const entry = entryFor(path);
+        if (entry.kind === "download") {
+          const link = document.createElement("a");
+          link.href = `data:${entry.mime || "application/octet-stream"};base64,${entry.data}`;
+          link.download = path.split("/").pop();
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          return;
+        }
         selectedPath = path;
         sessionStorage.setItem("manimflow.code.selected", path);
         const [klass, glyph] = iconInfo(path);
@@ -144,7 +159,7 @@
         tabIcon.className = `icon ${klass}`;
         tabIcon.textContent = glyph;
         document.getElementById("tab-name").textContent = path;
-        fallback.textContent = files[path] || "";
+        fallback.textContent = entry.content || "";
         if (editor) editor.setModel(modelFor(path));
         renderTree();
       }
@@ -154,10 +169,11 @@
         const paths = Object.keys(files).sort();
         for (const [path, model] of models) {
           if (!(path in files)) { model.dispose(); models.delete(path); }
-          else if (model.getValue() !== files[path]) model.setValue(files[path]);
+          else if (entryFor(path).kind === "text" && model.getValue() !== entryFor(path).content) model.setValue(entryFor(path).content || "");
         }
         const remembered = sessionStorage.getItem("manimflow.code.selected");
-        const next = paths.includes(selectedPath) ? selectedPath : paths.includes(remembered) ? remembered : paths.includes("scene.py") ? "scene.py" : paths[0];
+        const textPaths = paths.filter(path => entryFor(path).kind !== "download");
+        const next = textPaths.includes(selectedPath) ? selectedPath : textPaths.includes(remembered) ? remembered : textPaths.includes("scene.py") ? "scene.py" : textPaths[0];
         document.getElementById("status").textContent = `${paths.length} file${paths.length === 1 ? "" : "s"} · UTF-8`;
         renderTree();
         if (next) selectFile(next);
