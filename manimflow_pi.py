@@ -16,7 +16,7 @@ import urllib.request
 PI_VERSION = "0.80.6"
 COPILOT_BASE = "https://api.individual.githubcopilot.com"
 COPILOT_PROVIDER = "manimflow-copilot"
-COPILOT_MODEL = "claude-sonnet-4.5"
+COPILOT_MODEL = "gemini-2.5-pro"
 COPILOT_TOKEN_ENV = "MANIMFLOW_COPILOT_TOKEN"
 EXA_ENDPOINT = "https://demos.exa.ai/chatbot-demo/api/chat/stream"
 EXA_MODEL = "google/gemini-2.5-flash"
