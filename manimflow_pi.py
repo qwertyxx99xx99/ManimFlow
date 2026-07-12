@@ -170,7 +170,8 @@ def write_project_files(workspace, prompt, plan, require_docs):
         + docs
         + "Create helper modules first and scene.py last.\n"
         "Every Python file must start with: from manim import *\n"
-        "scene.py must define AnimScene(Scene).\n"
+        "scene.py must define exactly one direct Scene subclass: class AnimScene(Scene).\n"
+        "Implement every planned scene sequentially inside AnimScene.construct(). Helper modules may define Mobject/VGroup classes and functions, but must not define Scene subclasses. Never alias AnimScene, never use multiple inheritance between Scene classes, and never render separate scene classes.\n"
         "A full LaTeX toolchain is installed. Use MathTex for mathematics, Tex for mixed LaTeX prose and math, and Text only for ordinary labels. Never avoid LaTeX to bypass an error.\n"
         "Use Arrow(start=..., end=...) for arrows. Keep objects inside the frame and avoid overlaps.\n"
         f'Repeatedly run and repair: "{sys.executable}" -m manim -pql --disable_caching scene.py AnimScene\n'
@@ -213,8 +214,37 @@ def write_pi_config(agent_dir, provider, extension):
         shutil.copy2(extension, destination / "exa_direct.ts")
 
 
-def newest_video(workspace):
-    videos = [p for p in workspace.rglob("*.mp4") if p.is_file() and p.stat().st_size > 50_000]
+def video_duration(path):
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=20,
+        )
+        return float(result.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0.0
+
+
+def minimum_video_duration(plan):
+    scene_count = len(re.findall(r"(?m)^\s*\d+[.)]\s+", plan))
+    return max(6.0, scene_count * 2.0)
+
+
+def newest_video(workspace, minimum_duration=0):
+    videos = [
+        p
+        for p in workspace.rglob("AnimScene.mp4")
+        if p.is_file()
+        and "partial_movie_files" not in p.parts
+        and p.stat().st_size > 50_000
+        and video_duration(p) >= minimum_duration
+    ]
     return max(videos, key=lambda p: p.stat().st_mtime) if videos else None
 
 
@@ -361,6 +391,7 @@ def run_pi(args):
     )
     reads = set()
     video = None
+    required_duration = minimum_video_duration(plan)
     details = {}
     for attempt in range(1, args.attempts + 1):
         print(f"Starting Pi agent attempt {attempt}/{args.attempts}...", flush=True)
@@ -376,10 +407,14 @@ def run_pi(args):
                 print(update, flush=True)
         code = process.wait()
         print(f"Pi attempt {attempt} exit code: {code}", flush=True)
-        video = newest_video(workspace)
+        video = newest_video(workspace, required_duration)
         if video:
             break
-        state = "scene.py is missing" if not (workspace / "scene.py").is_file() else "no valid MP4 was rendered"
+        state = (
+            "scene.py is missing"
+            if not (workspace / "scene.py").is_file()
+            else f"no assembled AnimScene.mp4 of at least {required_duration:g} seconds was rendered"
+        )
         task = (
             f"Continue from the existing workspace. The previous attempt ended with {state}. Inspect all "
             "files, finish or repair the implementation, run the exact render command in AGENTS.md, and "
