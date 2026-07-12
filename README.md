@@ -145,7 +145,7 @@ The repository contains earlier interfaces that are no longer the primary produc
 
 ### GitHub Actions renderer
 
-`.github/workflows/render.yml` renders an issue after the repository owner applies the `manim` label. It runs the same six-attempt autonomous Pi pipeline with GitHub Copilot and `gemini-2.5-pro`, then publishes the resulting MP4 as a workflow artifact.
+`.github/workflows/render.yml` renders an issue after the repository owner applies the `manim` label. It runs the same six-attempt autonomous Pi pipeline with GitHub Copilot and `gpt-4o`, then publishes the resulting MP4 as a workflow artifact.
 
 ### Colab notebook
 
