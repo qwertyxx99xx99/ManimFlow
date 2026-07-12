@@ -145,17 +145,17 @@ The repository contains earlier interfaces that are no longer the primary produc
 
 ### GitHub Actions renderer
 
-`.github/workflows/render.yml` renders an issue after the repository owner applies the `manim` label. It uses the legacy Actions worker and publishes the resulting MP4 as a workflow artifact.
+`.github/workflows/render.yml` renders an issue after the repository owner applies the `manim` label. It runs the same six-attempt autonomous Pi pipeline with GitHub Copilot and `claude-sonnet-4.5`, then publishes the resulting MP4 as a workflow artifact.
 
 ### Colab notebook
 
-`ManimFlow.ipynb` contains the earlier interactive Colab workflow.
+`ManimFlow.ipynb` provides an interactive Exa-only Colab workflow. It installs the pinned Pi runtime and uses the same hardened Exa provider extension and autonomous render loop as the Streamlit app.
 
 [Open the Colab notebook](https://colab.research.google.com/github/theabbie/ManimFlow/blob/main/ManimFlow.ipynb)
 
-### Legacy CLI
+### Colab CLI
 
-The `manimflow` script runs the older Colab-backed workflow from a terminal. It requires `colab-cli` and an authenticated Colab session.
+The `manimflow` script launches the Exa and Pi pipeline in a temporary Colab session, streams useful progress, and downloads the rendered MP4. It requires `colab-cli` and an authenticated Colab session.
 
 ```bash
 pip install colab-cli

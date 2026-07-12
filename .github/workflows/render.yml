@@ -39,10 +39,20 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            libcairo2-dev libpango1.0-dev ffmpeg \
+            libcairo2-dev libpango1.0-dev ffmpeg ripgrep fd-find \
             texlive-latex-base texlive-latex-extra \
             texlive-fonts-recommended texlive-plain-generic dvisvgm \
             2>&1 | tail -5
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.19.0'
+          cache: npm
+
+      - name: Install Pi
+        run: npm ci --no-audit --no-fund
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -54,14 +64,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .venv
-          key: venv-manim-py311-v3
+          key: venv-manim-py311-pi-v1
 
       - name: Install Python deps
         if: steps.venv-cache.outputs.cache-hit != 'true'
         run: |
           python -m venv .venv
           .venv/bin/pip install -q numpy==1.26.4 scipy==1.13.1
-          .venv/bin/pip install -q manim aider-chat
+          .venv/bin/pip install -q manim
 
       - name: Activate virtualenv
         run: echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH

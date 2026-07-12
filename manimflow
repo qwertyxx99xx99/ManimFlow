@@ -1,268 +1,154 @@
 #!/usr/bin/env python3
 
-import sys, os, subprocess, pathlib, tempfile, time, re, json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
 
 R = "\033[31m"; G = "\033[32m"; Y = "\033[33m"; B = "\033[34m"; RESET = "\033[0m"
-def info(msg):  print(f"{B}[manimflow]{RESET} {msg}", flush=True)
-def ok(msg):    print(f"{G}[manimflow]{RESET} {msg}", flush=True)
-def warn(msg):  print(f"{Y}[manimflow]{RESET} {msg}", flush=True)
-def err(msg):   print(f"{R}[manimflow]{RESET} {msg}", flush=True)
+def info(message): print(f"{B}[manimflow]{RESET} {message}", flush=True)
+def ok(message): print(f"{G}[manimflow]{RESET} {message}", flush=True)
+def warn(message): print(f"{Y}[manimflow]{RESET} {message}", flush=True)
+def err(message): print(f"{R}[manimflow]{RESET} {message}", flush=True)
 
-def check_deps():
-    if subprocess.run(["which", "colab"], capture_output=True).returncode != 0:
-        err("colab CLI not found.")
-        print("  Install: pip install colab-cli")
-        sys.exit(1)
-    out = subprocess.run(["colab", "sessions"], capture_output=True, text=True)
-    if "not logged in" in (out.stdout + out.stderr).lower() or out.returncode == 2:
-        err("Not logged in to Colab.")
-        print("  Run: colab login")
-        sys.exit(1)
 
-check_deps()
-
-if len(sys.argv) < 2:
-    print("Usage: manimflow \"your video prompt\"")
-    sys.exit(1)
-
-PROMPT = " ".join(sys.argv[1:])
-OUTPUT_DIR = pathlib.Path.home() / "ManimFlow_videos"
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-def run(cmd, capture=False, **kw):
+def run(command, capture=False, **kwargs):
     if capture:
-        r = subprocess.run(cmd, capture_output=True, text=True, **kw)
-        return r.stdout + r.stderr, r.returncode
-    return subprocess.run(cmd, **kw).returncode
+        result = subprocess.run(command, capture_output=True, text=True, **kwargs)
+        return result.stdout + result.stderr, result.returncode
+    return subprocess.run(command, **kwargs).returncode
 
-def kill_all_sessions():
-    warn("Killing all existing Colab sessions...")
-    out, _ = run(["colab", "sessions"], capture=True)
-    for m in re.finditer(r"\[([a-f0-9]{6})\]", out):
-        name = m.group(1)
-        run(["colab", "stop", "-s", name], capture=True)
-        info(f"  killed {name}")
+
+def check_dependencies():
+    if not shutil_which("colab"):
+        err("colab CLI not found. Install it with: pip install colab-cli")
+        raise SystemExit(1)
+    output, code = run(["colab", "sessions"], capture=True)
+    if "not logged in" in output.lower() or code == 2:
+        err("Not logged in to Colab. Run: colab login")
+        raise SystemExit(1)
+
+
+def shutil_which(command):
+    from shutil import which
+    return which(command)
+
+
+def stop_existing_sessions():
+    warn("Stopping existing Colab sessions...")
+    output, _ = run(["colab", "sessions"], capture=True)
+    for match in re.finditer(r"\[([a-f0-9]{6})\]", output):
+        run(["colab", "stop", "-s", match.group(1)], capture=True)
     time.sleep(3)
 
-def new_session():
-    info("Creating Colab session (T4 GPU)...")
-    out, rc = run(["colab", "new", "--gpu", "T4"], capture=True)
-    m = re.search(r"Creating session '([a-f0-9]+)'", out)
-    if rc != 0:
-        if "TooManyAssignments" in out or "Precondition" in out:
-            return None
-        err(out)
-        sys.exit(1)
-    if m:
-        return m.group(1)
-    err(f"Could not parse session ID from: {out}")
-    sys.exit(1)
+
+def create_session():
+    output, code = run(["colab", "new", "--gpu", "T4"], capture=True)
+    match = re.search(r"Creating session '([a-f0-9]+)'", output)
+    if code == 0 and match:
+        return match.group(1)
+    if "TooManyAssignments" in output or "Precondition" in output:
+        return None
+    err(output)
+    raise SystemExit(1)
+
 
 def get_session():
-    session = new_session()
-    if session is None:
-        kill_all_sessions()
-        session = new_session()
-        if session is None:
-            err("Could not create session even after killing all")
-            sys.exit(1)
+    session = create_session()
+    if session:
+        return session
+    stop_existing_sessions()
+    session = create_session()
+    if not session:
+        err("Could not create a Colab session.")
+        raise SystemExit(1)
     return session
 
-WORKER = f'''
-import sys, subprocess, pathlib, os, json, re, threading, urllib.request, shutil
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
 
-print("=== Installing deps ===", flush=True)
-if subprocess.run(["dpkg", "-s", "libpango1.0-dev"], capture_output=True).returncode != 0:
-    subprocess.run(["apt-get", "install", "-y", "-q",
-        "libcairo2-dev", "libpango1.0-dev", "ffmpeg",
-        "texlive-latex-base", "texlive-latex-extra",
-        "texlive-fonts-recommended", "texlive-plain-generic", "dvisvgm"], check=True)
-subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--upgrade",
-    "numpy==1.26.4", "scipy==1.13.1"], check=True)
-subprocess.run([sys.executable, "-m", "pip", "install", "-q", "manim"], check=True)
-subprocess.run([sys.executable, "-m", "pip", "install", "-q", "aider-chat"], check=True)
-print("=== Deps ready ===", flush=True)
+check_dependencies()
+if len(sys.argv) < 2:
+    print('Usage: manimflow "your video prompt"')
+    raise SystemExit(1)
 
-BASE = pathlib.Path("/content")
-MANIM_OUTPUT = BASE / "manim_output"
-MANIM_OUTPUT.mkdir(parents=True, exist_ok=True)
-EXA_URL = "https://demos.exa.ai/chatbot-demo/api/chat/stream"
-LOCAL_PORT = 18642
+prompt = " ".join(sys.argv[1:])
+output_dir = pathlib.Path.home() / "ManimFlow_videos"
+output_dir.mkdir(exist_ok=True)
+slug = re.sub(r"[^a-zA-Z0-9]+", "_", prompt[:50]).strip("_") or "animation"
+output_path = output_dir / f"{slug}.mp4"
 
-def _strip(t):
-    i = t.find("\\n\\n```followups")
-    if i >= 0: t = t[:i]
-    return re.sub(r"\\n\\[.*?\\]\\s*$", "", t, flags=re.DOTALL).rstrip()
+worker = f'''
+import pathlib, shutil, subprocess, sys, threading, time, urllib.request
 
-def _exa(messages):
-    non_sys = [m for m in messages if m["role"] != "system"]
-    sys_msg = next((m for m in messages if m["role"] == "system"), None)
-    last = non_sys[-1]
-    user_content = "IMPORTANT: use plain ``` for ALL code blocks, never ```python or ```bash.\\n\\n" + (sys_msg["content"] if sys_msg else "") + "\\n\\n" + last["content"]
-    payload = json.dumps({{"message": user_content,
-        "history": [{{"role": m["role"], "content": m["content"]}} for m in non_sys[:-1]],
-        "exaEnabled": False, "model": "google/gemini-2.5-flash", "searchType": "instant"}}).encode()
-    req = urllib.request.Request(EXA_URL, data=payload,
-        headers={{"Content-Type": "application/json", "Accept": "text/event-stream"}})
-    full = ""; evt = None
-    with urllib.request.urlopen(req, timeout=180) as resp:
-        buf = b""
-        for raw in resp:
-            buf += raw
-            lines = buf.split(b"\\n"); buf = lines.pop()
-            for line in lines:
-                t = line.decode("utf-8", errors="replace").strip()
-                if not t: continue
-                if t.startswith("event:"): evt = t[6:].strip()
-                elif t.startswith("data:") and evt == "content":
-                    try: full += json.loads(t[5:].strip()).get("content", "")
-                    except: pass
-    return _strip(full)
-
-class _TS(ThreadingMixIn, HTTPServer): daemon_threads = True
-class _H(BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
-    def do_GET(self):
-        if self.path == "/v1/models":
-            b = json.dumps({{"object":"list","data":[{{"id":"manimator","object":"model","created":0,"owned_by":"exa"}}]}}).encode()
-            self.send_response(200); self.send_header("Content-Type","application/json"); self.end_headers(); self.wfile.write(b)
-        else: self.send_response(404); self.end_headers()
-    def do_POST(self):
-        if self.path != "/v1/chat/completions": self.send_response(404); self.end_headers(); return
-        n = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(n))
-        try: content = _exa(body.get("messages", []))
-        except Exception as e:
-            self.send_response(500); self.send_header("Content-Type","application/json"); self.end_headers()
-            self.wfile.write(json.dumps({{"error": str(e)}}).encode()); return
-        rb = json.dumps({{"id":"chatcmpl-local","object":"chat.completion","model":"manimator",
-            "choices":[{{"index":0,"message":{{"role":"assistant","content":content}},"finish_reason":"stop"}}],
-            "usage":{{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}}}).encode()
-        self.send_response(200); self.send_header("Content-Type","application/json")
-        self.send_header("Content-Length", str(len(rb))); self.end_headers(); self.wfile.write(rb)
-
-try:
-    srv = _TS(("127.0.0.1", LOCAL_PORT), _H)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    print(f"LLM proxy on :{{LOCAL_PORT}}", flush=True)
-except OSError:
-    print(f"port {{LOCAL_PORT}} already bound", flush=True)
-
-def _keepalive():
-    import time, urllib.request as _ur
+def keepalive():
     while True:
         time.sleep(25)
         try:
-            _ur.urlopen("http://172.28.0.1:9000/api/kernels", timeout=5)
+            urllib.request.urlopen("http://172.28.0.1:9000/api/kernels", timeout=5)
         except Exception:
             pass
-threading.Thread(target=_keepalive, daemon=True).start()
+threading.Thread(target=keepalive, daemon=True).start()
 
-for f in MANIM_OUTPUT.glob("*.py"): f.unlink()
-for f in MANIM_OUTPUT.glob("*.md"): f.unlink()
-git_dir = MANIM_OUTPUT / ".git"
-if git_dir.exists(): shutil.rmtree(git_dir)
+print("Installing Manim and Pi...", flush=True)
+subprocess.run(["apt-get", "update", "-qq"], check=True)
+subprocess.run(["apt-get", "install", "-y", "-q",
+    "libcairo2-dev", "libpango1.0-dev", "ffmpeg", "ripgrep", "fd-find",
+    "texlive-latex-base", "texlive-latex-extra", "texlive-fonts-recommended",
+    "texlive-plain-generic", "dvisvgm"], check=True)
+if shutil.which("fdfind") and not pathlib.Path("/usr/local/bin/fd").exists():
+    pathlib.Path("/usr/local/bin/fd").symlink_to(shutil.which("fdfind"))
+subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+    "numpy==1.26.4", "scipy==1.13.1", "manim", "nodeenv"], check=True)
 
-PROMPT = {repr(PROMPT)}
-print(f"\\n=== Planning ===", flush=True)
+base = pathlib.Path("/content")
+node_dir = base / "node22"
+pi_dir = base / "pi-runtime"
+if not (node_dir / "bin" / "node").exists():
+    subprocess.run([sys.executable, "-m", "nodeenv", "--node=22.19.0", "--prebuilt", str(node_dir)], check=True)
+subprocess.run([str(node_dir / "bin" / "npm"), "install", "--prefix", str(pi_dir),
+    "--no-audit", "--no-fund", "@earendil-works/pi-coding-agent@0.80.6"], check=True)
 
-payload = json.dumps({{"model":"manimator","messages":[
-    {{"role":"system","content":(
-        "You are a Manim animation planner. Output ONLY a numbered scene plan — "
-        "no questions, no clarifications, no preamble, no code blocks. "
-        "Scale scenes: short→3-4, default→5-6, long/detailed→8-12. "
-        "Plain English per scene: shapes/colors, motion, equations/labels. Never ask anything."
-    )}},
-    {{"role":"user","content":PROMPT}},
-],"max_tokens":2048}}).encode()
-req = urllib.request.Request(f"http://127.0.0.1:{{LOCAL_PORT}}/v1/chat/completions",
-    data=payload, headers={{"Content-Type":"application/json","Authorization":"Bearer dummy"}})
-with urllib.request.urlopen(req, timeout=180) as resp:
-    raw = json.loads(resp.read())["choices"][0]["message"]["content"].strip()
+raw = "https://raw.githubusercontent.com/theabbie/ManimFlow/main"
+runner = base / "manimflow_pi.py"
+extension = base / "exa_direct.ts"
+urllib.request.urlretrieve(raw + "/manimflow_pi.py", runner)
+urllib.request.urlretrieve(raw + "/pi_extensions/exa_direct.ts", extension)
 
-raw = re.sub(r"```.*?```", "", raw, flags=re.DOTALL).strip()
-for marker in ["Would you like","Do you want","Should I","Could you clarify",
-               "Can you provide","What specific","How long","Any specific","Let me know"]:
-    for sep in ("\\n\\n","\\n"):
-        idx = raw.find(sep + marker)
-        if idx >= 0: raw = raw[:idx]
-plan = raw.strip()
-print(f"\\n=== Scene Plan ===\\n{{plan}}\\n{{'='*40}}", flush=True)
-
-(MANIM_OUTPUT / "plan.md").write_text(f"# Animation Plan\\n\\n## Original request\\n{{PROMPT}}\\n\\n## Scenes\\n{{plan}}\\n")
-subprocess.run(["git","init"], cwd=str(MANIM_OUTPUT), capture_output=True)
-subprocess.run(["git","add","plan.md"], cwd=str(MANIM_OUTPUT), capture_output=True)
-subprocess.run(["git","commit","-m","init"], cwd=str(MANIM_OUTPUT), capture_output=True)
-
-aider_env = {{**os.environ, "OPENAI_API_KEY":"dummy",
-             "GIT_AUTHOR_NAME":"aider","GIT_AUTHOR_EMAIL":"aider@colab",
-             "GIT_COMMITTER_NAME":"aider","GIT_COMMITTER_EMAIL":"aider@colab"}}
-
-print("\\n=== Aider: coding + auto-fix loop ===", flush=True)
-r = subprocess.run(
-    ["aider","--model","openai/manimator",
-     "--openai-api-base",f"http://127.0.0.1:{{LOCAL_PORT}}/v1",
-     "--openai-api-key","dummy",
-     "--yes-always","--no-auto-commits","--no-pretty",
-     "--no-show-model-warnings","--no-check-update",
-     "--test-cmd","python3 -m manim -pql --disable_caching scene.py AnimScene 2>&1",
-     "--auto-test","--message",
-     "Read plan.md and implement the animation as a Manim project.\\n\\n"
-     "Write in this order: helper modules first, scene.py last.\\n"
-     "scene.py defines AnimScene(Scene) and runs with:\\n"
-     "  python3 -m manim -pql --disable_caching scene.py AnimScene\\n\\n"
-     "Rules: AnimScene(Scene) in scene.py | MathTex for equations | Text() for prose | "
-     "Arrow(start=...,end=...) only | visually complete",
-     "plan.md"],
-    cwd=str(MANIM_OUTPUT), text=True, timeout=1800, env=aider_env,
-    stderr=subprocess.STDOUT,
-)
-print(f"aider exit: {{r.returncode}}", flush=True)
-
-videos = [v for v in MANIM_OUTPUT.rglob("*.mp4") if v.stat().st_size > 50_000]
-if videos:
-    dest = BASE / "animation.mp4"
-    shutil.copy(sorted(videos, key=lambda p: p.stat().st_mtime)[-1], dest)
-    print(f"SUCCESS {{dest.stat().st_size:,}} bytes", flush=True)
-else:
-    print("FAILED: no valid video", flush=True)
-    sys.exit(1)
+command = [sys.executable, str(runner), "--provider", "exa", "--prompt", {prompt!r},
+    "--workspace", str(base / "manim_output"), "--output", str(base / "animation.mp4"),
+    "--pi", str(pi_dir / "node_modules" / ".bin" / "pi"),
+    "--exa-extension", str(extension), "--attempts", "6"]
+subprocess.run(command, check=True, timeout=3600)
 '''
 
-info(f"Prompt: {PROMPT!r}")
+info(f"Prompt: {prompt!r}")
 session = get_session()
 info(f"Session: {session}")
 
-slug = re.sub(r'[^a-zA-Z0-9]+', '_', PROMPT[:50]).strip('_')
-out_path = OUTPUT_DIR / f"{slug}.mp4"
-
-with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, prefix='manimflow_') as f:
-    f.write(WORKER)
-    worker_path = f.name
+with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix="manimflow_") as file:
+    file.write(worker)
+    worker_path = file.name
 
 try:
-    info("Uploading worker...")
+    info("Uploading autonomous Pi worker...")
     run(["colab", "upload", "-s", session, worker_path, "/content/worker.py"], capture=True)
-
-    info("Running render (10-30 min, all output shown)...")
-    rc = run(["colab", "exec", "-s", session, "--timeout", "5400", "-f", worker_path])
-
-    if rc != 0:
-        err(f"Worker failed (exit {rc})")
-        sys.exit(1)
-
-    info(f"Downloading video → {out_path}")
-    rc = run(["colab", "download", "-s", session, "/content/animation.mp4", str(out_path)])
-    if rc != 0:
-        err("Download failed")
-        sys.exit(1)
-
+    info("Running render; all useful Pi progress will be shown...")
+    code = run(["colab", "exec", "-s", session, "--timeout", "5400", "-f", worker_path])
+    if code:
+        err(f"Worker failed with exit code {code}.")
+        raise SystemExit(code)
+    info(f"Downloading video to {output_path}")
+    code = run(["colab", "download", "-s", session, "/content/animation.mp4", str(output_path)])
+    if code:
+        err("Video download failed.")
+        raise SystemExit(code)
 finally:
-    info("Stopping session...")
+    info("Stopping Colab session...")
     run(["colab", "stop", "-s", session], capture=True)
     os.unlink(worker_path)
 
 ok("Done!")
-print(f"\n{out_path}")
+print(f"\n{output_path}")
