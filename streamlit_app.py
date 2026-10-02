@@ -976,6 +976,44 @@ def video_duration(path):
         return 0.0
 
 
+def render_scene_directly(workspace, log_queue):
+    command = [
+        sys.executable,
+        "-m",
+        "manim",
+        "-pql",
+        "--disable_caching",
+        "scene.py",
+        "AnimScene",
+    ]
+    log_queue.put(("log", "ManimFlow is rendering the current scene draft..."))
+    process = subprocess.Popen(
+        command,
+        cwd=str(workspace),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    recent_output = []
+    if process.stdout is not None:
+        for output_line in process.stdout:
+            text = output_line.rstrip()
+            if not text:
+                continue
+            recent_output.append(text)
+            if len(recent_output) > 250:
+                del recent_output[0]
+            log_queue.put(("log", text[:1500]))
+    return_code = process.wait()
+    diagnostic = "\n".join(recent_output)
+    (workspace / "render_error.log").write_text(
+        f"Command: {' '.join(command)}\nExit code: {return_code}\n\n{diagnostic}\n"
+    )
+    return return_code
+
+
 def minimum_video_duration(plan):
     scene_count = len(re.findall(r"(?m)^\s*\d+[.)]\s+", plan))
     return max(6.0, scene_count * 2.0)
@@ -1372,8 +1410,11 @@ def _run_render(provider, credential, user_prompt, log_queue):
         max_attempts = 6
         for attempt in range(1, max_attempts + 1):
             log_queue.put(("log", f"Starting Pi agent attempt {attempt}/{max_attempts}..."))
+            attempt_command = list(command_prefix)
+            if provider == "exa" and (workspace / "render_error.log").is_file():
+                attempt_command.append("@render_error.log")
             process = subprocess.Popen(
-                [*command_prefix, task],
+                [*attempt_command, task],
                 cwd=str(workspace),
                 env=env,
                 stdout=subprocess.PIPE,
@@ -1423,6 +1464,17 @@ def _run_render(provider, credential, user_prompt, log_queue):
             if normalize_nested_workspace(workspace):
                 log_queue.put(("log", "Normalized accidental nested manim_output/ workspace."))
             video = newest_video(workspace, required_duration)
+            if provider == "exa" and video is None and (workspace / "scene.py").is_file():
+                render_scene_directly(workspace, log_queue)
+                video = newest_video(workspace, required_duration)
+                if video is None:
+                    diagnostic = workspace / "render_error.log"
+                    with diagnostic.open("a") as output:
+                        output.write(
+                            f"\nRequired final duration: at least {required_duration:g} seconds.\n"
+                            "No qualifying media/**/AnimScene.mp4 exists yet. Repair scene.py using "
+                            "the errors above, or expand the animation if the render is too short.\n"
+                        )
             if video is not None:
                 break
 
@@ -1454,11 +1506,12 @@ def _run_render(provider, credential, user_prompt, log_queue):
                     )
                 elif provider == "exa":
                     task = (
-                        f"A scene.py draft exists, but no valid AnimScene.mp4 of at least "
-                        f"{required_duration:g} seconds exists. Your first response must be a bash tool "
-                        "call running the exact Manim command from AGENTS.md. Use its output to edit and "
-                        "repair the existing implementation. Do not answer with prose or apologize; keep "
-                        "calling tools until every planned scene renders into the final MP4."
+                        f"The attached render_error.log shows why the current scene.py did not produce "
+                        f"a valid AnimScene.mp4 of at least {required_duration:g} seconds. Your first "
+                        "response must be an edit tool call repairing scene.py from that exact diagnostic. "
+                        "Do not rerun Manim, reread files, answer with prose, or apologize; ManimFlow will "
+                        "render automatically after your edit. Make the most complete repair possible in "
+                        "one edit call."
                     )
                 else:
                     task = (
