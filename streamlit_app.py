@@ -34,7 +34,7 @@ APP_DIR = pathlib.Path(__file__).resolve().parent
 LOCAL_PI = APP_DIR / "node_modules" / ".bin" / "pi"
 RUNTIME_DIR = pathlib.Path("/tmp/manimflow_pi_runtime")
 NODE_DIR = pathlib.Path("/tmp/manimflow_node")
-PI_VERSION = "0.80.6"
+PI_VERSION = "1.0.0"
 _PI_INSTALL_LOCK = threading.Lock()
 MANIM_DOCS_REPO = pathlib.Path("/tmp/manim_community_docs")
 MANIM_DOCS_URL = "https://github.com/ManimCommunity/manim.git"
@@ -678,27 +678,64 @@ def node_major(node_command):
         return 0
 
 
+def pi_version(pi_command, node_command=None):
+    try:
+        env = os.environ.copy()
+        if node_command:
+            env["PATH"] = (
+                f"{pathlib.Path(node_command).parent}:{env.get('PATH', '')}"
+            )
+        return subprocess.check_output(
+            [str(pi_command), "--version"],
+            text=True,
+            timeout=10,
+            env=env,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def resolve_pi_command(log_queue):
     configured = os.environ.get("PI_COMMAND", "").strip()
     if configured:
         return configured
     system_node = shutil.which("node")
-    if LOCAL_PI.exists() and system_node and node_major(system_node) >= 22:
+    if (
+        LOCAL_PI.exists()
+        and system_node
+        and node_major(system_node) >= 22
+        and pi_version(LOCAL_PI, system_node) == PI_VERSION
+    ):
         return str(LOCAL_PI)
     installed = shutil.which("pi")
-    if installed and system_node and node_major(system_node) >= 22:
+    if (
+        installed
+        and system_node
+        and node_major(system_node) >= 22
+        and pi_version(installed, system_node) == PI_VERSION
+    ):
         return installed
 
     runtime_pi = RUNTIME_DIR / "node_modules" / ".bin" / "pi"
     isolated_node = NODE_DIR / "bin" / "node"
     runtime_node = str(isolated_node) if isolated_node.exists() else system_node
-    if runtime_pi.exists() and runtime_node and node_major(runtime_node) >= 22:
+    if (
+        runtime_pi.exists()
+        and runtime_node
+        and node_major(runtime_node) >= 22
+        and pi_version(runtime_pi, runtime_node) == PI_VERSION
+    ):
         return str(runtime_pi)
 
     with _PI_INSTALL_LOCK:
         isolated_node = NODE_DIR / "bin" / "node"
         runtime_node = str(isolated_node) if isolated_node.exists() else shutil.which("node")
-        if runtime_pi.exists() and runtime_node and node_major(runtime_node) >= 22:
+        if (
+            runtime_pi.exists()
+            and runtime_node
+            and node_major(runtime_node) >= 22
+            and pi_version(runtime_pi, runtime_node) == PI_VERSION
+        ):
             return str(runtime_pi)
 
         node = shutil.which("node")
