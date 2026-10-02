@@ -930,13 +930,23 @@ def write_project_files(workspace, user_prompt, plan, require_docs=True):
         if require_docs
         else "Documentation reading is optional. Start implementation immediately and do not create docs_consulted.md unless it is genuinely useful.\n"
     )
+    startup_instruction = (
+        "Read plan.md before editing. Work without asking questions.\n"
+        if require_docs
+        else "The full plan.md is attached to the user request. Do not reread it or list the workspace before starting. Your first action must create scene.py with a complete initial implementation. Work without asking questions.\n"
+    )
+    implementation_order = (
+        "Create helper modules first and scene.py last.\n"
+        if require_docs
+        else "Create scene.py immediately. Add helper modules later only if they materially improve the animation.\n"
+    )
     (workspace / "AGENTS.md").write_text(
         "You are an autonomous coding agent building a Manim animation.\n"
-        "Read plan.md before editing. Work without asking questions.\n"
-        "The current working directory is already the project root. Write docs_consulted.md, helper modules, scene.py, and media directly here. Never create or write into a manim_output/ or project/ subdirectory.\n"
+        + startup_instruction
+        + "The current working directory is already the project root. Write docs_consulted.md, helper modules, scene.py, and media directly here. Never create or write into a manim_output/ or project/ subdirectory.\n"
         + documentation_gate
-        + "Create helper modules first and scene.py last.\n"
-        "Every Python file must start with: from manim import *\n"
+        + implementation_order
+        + "Every Python file must start with: from manim import *\n"
         "scene.py must define exactly one direct Scene subclass: class AnimScene(Scene).\n"
         "Implement every planned scene sequentially inside AnimScene.construct(). Helper modules may define Mobject/VGroup classes and functions, but must not define Scene subclasses. Never alias AnimScene, never use multiple inheritance between Scene classes, and never render separate scene classes.\n"
         "A full LaTeX toolchain is installed and available. Use MathTex for equations, variables, units, operators, and all mathematical notation. Use Tex for mixed LaTeX prose and mathematics, and Text only for ordinary non-mathematical labels.\n"
@@ -1321,9 +1331,13 @@ def _run_render(provider, credential, user_prompt, log_queue):
 
         if provider == "exa":
             task = (
-                "Implement the complete animation described in plan.md immediately. Use your "
-                "file and bash tools autonomously. Run the Manim test after edits, diagnose "
-                "failures, and keep repairing until it renders successfully. Do not ask questions."
+                "Begin implementation now. The plan is already attached, so do not reread it, "
+                "list files, discuss feasibility, estimate time, apologize, or describe what you "
+                "would do. Your first response must be a write tool call creating scene.py with a "
+                "complete first draft covering every planned scene. After that tool completes, run "
+                "the exact Manim command in AGENTS.md with bash and keep using tools to repair every "
+                "failure until the MP4 renders. A partial first draft is acceptable; a text-only "
+                "response is not."
             )
         else:
             task = (
@@ -1431,12 +1445,28 @@ def _run_render(provider, credential, user_prompt, log_queue):
                 log_queue.put(
                     ("log", f"Attempt {attempt} was incomplete ({state}); continuing autonomously...")
                 )
-                task = (
-                    f"The previous attempt exited prematurely: {state}. Continue from the existing "
-                    "workspace; do not restart or merely explain. Inspect every current file, finish "
-                    "scene.py and all required helpers, run the exact Manim test from AGENTS.md, fix "
-                    "all failures, and verify that a non-empty MP4 exists before stopping."
-                )
+                if provider == "exa" and missing_scene:
+                    task = (
+                        "Create scene.py now. Your first response must be a write tool call, not text, "
+                        "an apology, a plan, a read, or a directory listing. The attached plan contains "
+                        "all required context. Write a complete AnimScene implementation, then run the "
+                        "exact Manim command from AGENTS.md and repair errors with tools. Begin with write."
+                    )
+                elif provider == "exa":
+                    task = (
+                        f"A scene.py draft exists, but no valid AnimScene.mp4 of at least "
+                        f"{required_duration:g} seconds exists. Your first response must be a bash tool "
+                        "call running the exact Manim command from AGENTS.md. Use its output to edit and "
+                        "repair the existing implementation. Do not answer with prose or apologize; keep "
+                        "calling tools until every planned scene renders into the final MP4."
+                    )
+                else:
+                    task = (
+                        f"The previous attempt exited prematurely: {state}. Continue from the existing "
+                        "workspace; do not restart or merely explain. Inspect every current file, finish "
+                        "scene.py and all required helpers, run the exact Manim test from AGENTS.md, fix "
+                        "all failures, and verify that a non-empty MP4 exists before stopping."
+                    )
 
         if provider != "exa":
             validate_documentation_gate(workspace, observed_doc_reads)
