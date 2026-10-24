@@ -18,6 +18,7 @@ import urllib.parse
 import urllib.error
 import urllib.request
 
+import voiceover
 import streamlit as st
 import streamlit.components.v1 as components
 from cryptography.fernet import Fernet, InvalidToken
@@ -1531,8 +1532,20 @@ def _run_render(provider, credential, user_prompt, log_queue):
                 f"Pi did not produce a valid MP4 after {max_attempts} autonomous attempts."
             )
 
+        chats = {
+            "gemini": lambda m: gemini_chat(credential, m, log_queue),
+            "chatgpt": lambda m: chatgpt_codex_chat(credential, m, log_queue),
+            "anthropic": lambda m: anthropic_chat(credential, m, log_queue),
+            "exa": lambda m: exa_chat(m, log_queue),
+            "copilot": lambda m: copilot_chat(credential, m, log_queue),
+        }
         destination = run_dir / "animation.mp4"
-        shutil.copy2(video, destination)
+        narrated = voiceover.add_voiceover(
+            chats[provider], plan, video, destination,
+            log=lambda message: log_queue.put(("log", message)),
+        )
+        if narrated != destination:
+            shutil.copy2(video, destination)
         log_queue.put(("done", str(destination)))
     except Exception as exc:
         log_queue.put(("error", str(exc)))

@@ -12,6 +12,8 @@ import time
 import urllib.error
 import urllib.request
 
+import voiceover
+
 
 PI_VERSION = "0.80.6"
 COPILOT_BASE = "https://api.individual.githubcopilot.com"
@@ -446,7 +448,11 @@ def run_pi(args):
         validate_docs(workspace, reads)
         print(f"Documentation gate passed -> {len(reads)} distinct files read", flush=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(video, args.output)
+    chat = exa_chat if args.provider == "exa" else lambda m: copilot_chat(token, m)
+    if args.no_voiceover:
+        shutil.copy2(video, args.output)
+    elif voiceover.add_voiceover(chat, plan, video, args.output, log=lambda m: print(m, flush=True)) == video:
+        shutil.copy2(video, args.output)
     print(f"SUCCESS -> {args.output} ({args.output.stat().st_size:,} bytes)", flush=True)
 
 
@@ -459,6 +465,7 @@ def parse_args():
     parser.add_argument("--pi", default=shutil.which("pi") or "pi")
     parser.add_argument("--exa-extension", type=pathlib.Path)
     parser.add_argument("--token-env", default="COPILOT_TOKEN")
+    parser.add_argument("--no-voiceover", action="store_true")
     parser.add_argument("--attempts", type=int, default=6)
     return parser.parse_args()
 

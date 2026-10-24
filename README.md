@@ -14,9 +14,14 @@ ManimFlow turns a natural-language animation request into a rendered Manim video
 4. Generates modular Manim source files and shows them in a live, read-only Monaco browser.
 5. Runs Manim, observes errors, edits the project, and retries until a valid MP4 is available.
 6. Displays the video for playback and download.
-7. Suggests editable YouTube metadata and can upload the result after browser-based YouTube authorization.
+7. Adds an AI voiceover (narration script written from the scene plan, spoken with the AbbieSpeak voice and muxed into the MP4).
+8. Suggests editable YouTube metadata and can upload the result after browser-based YouTube authorization.
 
 Long and detailed prompts receive longer scene plans. Mathematical and scientific animations use the installed LaTeX toolchain through `MathTex` and `Tex`.
+
+## Voiceover
+
+`voiceover.py` writes a narration script from the scene plan, synthesizes it with [`theabbie/AbbieSpeak`](https://huggingface.co/theabbie/AbbieSpeak) (`hf download` of `speak.py`, run through `uv run`), and muxes it into the MP4 with FFmpeg, holding the last frame if the narration runs longer than the video. `speak.py` and its model weights download on first use and are cached; the GitHub Actions workflow prefetches them in a build step. If voiceover fails, the silent video is returned. Set `HF_TOKEN` for faster downloads, and pass `--no-voiceover` to `manimflow_pi.py` to skip it.
 
 ## Model providers
 

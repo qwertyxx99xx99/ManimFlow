@@ -76,6 +76,11 @@ jobs:
       - name: Activate virtualenv
         run: echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
 
+      - name: Install voiceover (AbbieSpeak)
+        run: |
+          .venv/bin/pip install -q huggingface_hub uv
+          .venv/bin/python -c "import voiceover; voiceover.ensure_speak()"
+
       - name: Configure git
         run: |
           git config --global user.name "manimflow"
