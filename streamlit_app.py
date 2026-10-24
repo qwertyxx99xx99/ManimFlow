@@ -957,6 +957,7 @@ def write_project_files(workspace, user_prompt, plan, require_docs=True):
         "Keep every object inside the camera frame and avoid overlaps.\n"
         "Repeatedly run this test and repair every error:\n"
         f"{render_command}\n"
+        "Never end on an empty or black frame: do not FadeOut all objects at the end. Finish on a final summary or key visual that stays on screen, then call self.wait(2).\n"
         "Stop only after the command succeeds and produces an MP4.\n"
     )
 
@@ -1248,7 +1249,7 @@ def is_rate_limit_event(line):
     return "429" in error_text or "too many requests" in error_text
 
 
-def _run_render(provider, credential, user_prompt, log_queue):
+def _run_render(provider, credential, user_prompt, log_queue, with_voiceover=True):
     clean_old_runs()
     run_dir = pathlib.Path(tempfile.mkdtemp(prefix="run-", dir=BASE))
     workspace = run_dir / "project"
@@ -1466,6 +1467,8 @@ def _run_render(provider, credential, user_prompt, log_queue):
 
             if normalize_nested_workspace(workspace):
                 log_queue.put(("log", "Normalized accidental nested manim_output/ workspace."))
+            if reviews:
+                layout_review.settle(workspace, log=lambda m: log_queue.put(("log", m)))
             video = newest_video(workspace, required_duration)
             if provider == "exa" and video is None and (workspace / "scene.py").is_file():
                 render_scene_directly(workspace, log_queue)
@@ -1544,18 +1547,21 @@ def _run_render(provider, credential, user_prompt, log_queue):
                 f"Pi did not produce a valid MP4 after {max_attempts} autonomous attempts."
             )
 
-        chats = {
-            "gemini": lambda m: gemini_chat(credential, m, log_queue),
-            "chatgpt": lambda m: chatgpt_codex_chat(credential, m, log_queue),
-            "anthropic": lambda m: anthropic_chat(credential, m, log_queue),
-            "exa": lambda m: exa_chat(m, log_queue),
-            "copilot": lambda m: copilot_chat(credential, m, log_queue),
-        }
         destination = run_dir / "animation.mp4"
-        narrated = voiceover.add_voiceover(
-            chats[provider], plan, video, destination,
-            log=lambda message: log_queue.put(("log", message)),
-        )
+        if with_voiceover:
+            chats = {
+                "gemini": lambda m: gemini_chat(credential, m, log_queue),
+                "chatgpt": lambda m: chatgpt_codex_chat(credential, m, log_queue),
+                "anthropic": lambda m: anthropic_chat(credential, m, log_queue),
+                "exa": lambda m: exa_chat(m, log_queue),
+                "copilot": lambda m: copilot_chat(credential, m, log_queue),
+            }
+            narrated = voiceover.add_voiceover(
+                chats[provider], plan, video, destination,
+                log=lambda message: log_queue.put(("log", message)),
+            )
+        else:
+            narrated = video
         if narrated != destination:
             shutil.copy2(video, destination)
         log_queue.put(("done", str(destination)))
@@ -1563,7 +1569,7 @@ def _run_render(provider, credential, user_prompt, log_queue):
         log_queue.put(("error", str(exc)))
 
 
-def run_render(provider, credential, user_prompt, log_queue):
+def run_render(provider, credential, user_prompt, log_queue, with_voiceover=True):
     if not _RENDER_SEMAPHORE.acquire(blocking=False):
         log_queue.put(
             ("log", "Another animation is currently rendering; this request is queued.")
@@ -1571,7 +1577,7 @@ def run_render(provider, credential, user_prompt, log_queue):
         _RENDER_SEMAPHORE.acquire()
         log_queue.put(("log", "Render slot available; starting this request."))
     try:
-        _run_render(provider, credential, user_prompt, log_queue)
+        _run_render(provider, credential, user_prompt, log_queue, with_voiceover)
     finally:
         _RENDER_SEMAPHORE.release()
 
@@ -1652,6 +1658,7 @@ provider_label = st.radio(
     index=4,
     horizontal=True,
 )
+enable_voiceover = st.checkbox("Enable voiceover", value=True)
 selected_provider = {
     "GitHub Copilot": "copilot",
     "Google Gemini": "gemini",
@@ -1813,7 +1820,7 @@ if generate and prompt.strip():
     )
     thread = threading.Thread(
         target=run_render,
-        args=(selected_provider, credential, prompt.strip(), events),
+        args=(selected_provider, credential, prompt.strip(), events, enable_voiceover),
         daemon=True,
     )
     thread.start()

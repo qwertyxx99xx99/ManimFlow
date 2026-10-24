@@ -72,11 +72,60 @@ def media_duration(path):
     return float(result.stdout.strip())
 
 
+DARK_LUMA = 17
+MIN_DARK_TAIL = 0.3
+FADE_LOOKBACK = 3.0
+
+
+def frame_brightness(video):
+    result = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(video), "-an",
+         "-vf", "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-",
+         "-f", "null", "-"],
+        capture_output=True, text=True, check=True, timeout=300,
+    )
+    times, levels = [], []
+    for line in result.stdout.splitlines():
+        if "pts_time:" in line:
+            times.append(float(line.split("pts_time:", 1)[1].split()[0]))
+        elif "signalstats.YAVG=" in line:
+            levels.append(float(line.split("=", 1)[1]))
+    count = min(len(times), len(levels))
+    return times[:count], levels[:count]
+
+
+def last_visible_cut(video):
+    try:
+        times, levels = frame_brightness(video)
+    except (subprocess.SubprocessError, ValueError):
+        return None
+    if len(times) < 3:
+        return None
+    tail = len(levels)
+    while tail > 0 and levels[tail - 1] < DARK_LUMA:
+        tail -= 1
+    if tail == 0 or tail == len(levels):
+        return None
+    frame = times[1] - times[0]
+    if times[-1] + frame - times[tail] < MIN_DARK_TAIL:
+        return None
+    window = [i for i in range(tail) if times[i] >= times[tail - 1] - FADE_LOOKBACK]
+    peak = max(levels[i] for i in window)
+    hold = max(i for i in window if levels[i] >= peak * 0.995)
+    return times[hold] + frame
+
+
 def mux(video, wav, output):
-    extra = max(0.0, media_duration(wav) - media_duration(video))
+    audio = media_duration(wav)
+    length = media_duration(video)
+    cut = last_visible_cut(video)
     command = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video), "-i", str(wav)]
-    if extra > 0.05:
-        command += ["-vf", f"tpad=stop_mode=clone:stop_duration={extra:.3f}",
+    if cut:
+        pad = max(0.0, audio - cut)
+        command += ["-vf", f"trim=end={cut:.3f},setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={pad:.3f}",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p"]
+    elif audio - length > 0.05:
+        command += ["-vf", f"tpad=stop_mode=clone:stop_duration={audio - length:.3f}",
                     "-c:v", "libx264", "-pix_fmt", "yuv420p"]
     else:
         command += ["-c:v", "copy"]

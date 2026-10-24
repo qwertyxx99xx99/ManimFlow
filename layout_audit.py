@@ -4,11 +4,12 @@ from itertools import combinations
 from pathlib import Path
 
 import numpy as np
-from manim import DOWN, LEFT, RIGHT, UP, Mobject, Scene, config, tempconfig
+from manim import DOWN, LEFT, RIGHT, UP, CoordinateSystem, Line, Mobject, ParametricFunction, Scene, VMobject, config, tempconfig
 
 MIN_GAP = 0.15
 FRAME_MARGIN = 0.25
-MAX_FINDINGS = 25
+MAX_FINDINGS = 12
+TOUCH_DISTANCE = 0.05
 BACKGROUND_AREA = 0.5
 CIRCULAR = ("circle", "dot", "ellipse", "annulus", "sector", "arc")
 
@@ -26,6 +27,21 @@ def bounds_of(mob):
         float(mob.get_critical_point(DOWN)[1]),
         float(mob.get_critical_point(UP)[1]),
     )
+
+
+def is_thin(mob):
+    if isinstance(mob, (ParametricFunction, Line)):
+        return True
+    return type(mob) is VMobject and mob.get_fill_opacity() == 0
+
+
+def point_in_bounds(mob, bounds):
+    points = mob.get_all_points()[::3]
+    inside = (
+        (points[:, 0] >= bounds[0]) & (points[:, 0] <= bounds[1])
+        & (points[:, 1] >= bounds[2]) & (points[:, 1] <= bounds[3])
+    )
+    return bool(inside.any())
 
 
 def contains(outer, inner):
@@ -66,12 +82,21 @@ def audit_scene(scene):
         if parts:
             findings.append(f"{name} is outside the safe frame: " + ", ".join(parts))
     for (name_a, mob_a, a), (name_b, mob_b, b) in combinations(items, 2):
+        if isinstance(mob_a, CoordinateSystem) or isinstance(mob_b, CoordinateSystem):
+            continue
+        thin_a, thin_b = is_thin(mob_a), is_thin(mob_b)
+        if thin_a and thin_b:
+            continue
         overlap_x = min(a[1], b[1]) - max(a[0], b[0])
         overlap_y = min(a[3], b[3]) - max(a[2], b[2])
         if overlap_x > 0 and overlap_y > 0:
             if contains(a, b) or contains(b, a) or circular_clear(mob_a, mob_b):
                 continue
+            if thin_a != thin_b and not point_in_bounds(mob_a if thin_a else mob_b, b if thin_a else a):
+                continue
             findings.append(f"{name_a} overlaps {name_b} (x={overlap_x:.2f}, y={overlap_y:.2f})")
+            continue
+        if thin_a or thin_b:
             continue
         gap_x = max(a[0] - b[1], b[0] - a[1], 0.0)
         gap_y = max(a[2] - b[3], b[2] - a[3], 0.0)
@@ -124,9 +149,18 @@ def main():
     if not seen:
         print(f"layout audit: no issues across {plays} animation steps")
         return 0
+    def priority(item):
+        finding = item[0]
+        if "outside the safe frame" in finding:
+            return 0
+        return 1 if "overlaps" in finding else 2
+
+    ordered = sorted(seen.items(), key=priority)
     print(f"layout audit: {len(seen)} issues across {plays} animation steps")
-    for finding, step in list(seen.items())[:MAX_FINDINGS]:
+    for finding, step in ordered[:MAX_FINDINGS]:
         print(f"- after play() #{step}: {finding}")
+    if len(ordered) > MAX_FINDINGS:
+        print(f"- {len(ordered) - MAX_FINDINGS} lower-priority findings not shown")
     return 1
 
 

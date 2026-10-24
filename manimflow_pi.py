@@ -179,6 +179,7 @@ def write_project_files(workspace, prompt, plan, require_docs):
         "A full LaTeX toolchain is installed. Use MathTex for mathematics, Tex for mixed LaTeX prose and math, and Text only for ordinary labels. Never avoid LaTeX to bypass an error.\n"
         "Use Arrow(start=..., end=...) for arrows. Keep objects inside the frame and avoid overlaps.\n"
         f'Repeatedly run and repair: "{sys.executable}" -m manim -pql --disable_caching scene.py AnimScene\n'
+        "Never end on an empty or black frame: do not FadeOut all objects at the end. Finish on a final summary or key visual that stays on screen, then call self.wait(2).\n"
         "Stop only after that command succeeds and produces a valid MP4.\n"
     )
 
@@ -431,6 +432,8 @@ def run_pi(args):
         code = process.wait()
         print(f"Pi attempt {attempt} exit code: {code}", flush=True)
         normalize_nested_workspace(workspace)
+        if reviews:
+            layout_review.settle(workspace, log=lambda m: print(m, flush=True))
         video = newest_video(workspace, required_duration)
         if video:
             report = layout_review.audit_layout(workspace, log=lambda m: print(m, flush=True)) if reviews < layout_review.REVIEW_ROUNDS and attempt < args.attempts else ""
