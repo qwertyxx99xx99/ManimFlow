@@ -19,6 +19,10 @@ ManimFlow turns a natural-language animation request into a rendered Manim video
 
 Long and detailed prompts receive longer scene plans. Mathematical and scientific animations use the installed LaTeX toolchain through `MathTex` and `Tex`.
 
+## Layout review
+
+Once a valid video exists, `layout_review.py` runs `layout_audit.py`, a headless geometry audit adapted from [`gqy20/manim-agent`](https://github.com/gqy20/manim-agent). It dry-runs `scene.py` and flags overlapping objects, crowding, and objects outside the safe frame after each `play()` call. Labels inside their own box and full-frame backgrounds are skipped. Findings go back to Pi as a review round, up to two. Pi should fix them, but may ignore a finding it judges deliberate by recording `IGNORED: <finding> | <reason>` in `review_notes.md`. The audit is advisory: if it cannot run, or a revision breaks rendering, the last valid video is kept.
+
 ## Voiceover
 
 `voiceover.py` writes a narration script from the scene plan, synthesizes it with [`theabbie/AbbieSpeak`](https://huggingface.co/theabbie/AbbieSpeak) (`hf download` of `speak.py`, run through `uv run`), and muxes it into the MP4 with FFmpeg, holding the last frame if the narration runs longer than the video. `speak.py` and its model weights download on first use and are cached; the GitHub Actions workflow prefetches them in a build step. If voiceover fails, the silent video is returned. Set `HF_TOKEN` for faster downloads, and pass `--no-voiceover` to `manimflow_pi.py` to skip it.

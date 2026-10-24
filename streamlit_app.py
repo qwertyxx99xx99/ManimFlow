@@ -18,6 +18,7 @@ import urllib.parse
 import urllib.error
 import urllib.request
 
+import layout_review
 import voiceover
 import streamlit as st
 import streamlit.components.v1 as components
@@ -1409,6 +1410,7 @@ def _run_render(provider, credential, user_prompt, log_queue):
         video = None
         required_duration = minimum_video_duration(plan)
         max_attempts = 6
+        reviews = 0
         for attempt in range(1, max_attempts + 1):
             log_queue.put(("log", f"Starting Pi agent attempt {attempt}/{max_attempts}..."))
             attempt_command = list(command_prefix)
@@ -1477,7 +1479,17 @@ def _run_render(provider, credential, user_prompt, log_queue):
                             "the errors above, or expand the animation if the render is too short.\n"
                         )
             if video is not None:
-                break
+                report = (
+                    layout_review.audit_layout(workspace, log=lambda m: log_queue.put(("log", m)))
+                    if reviews < layout_review.REVIEW_ROUNDS and attempt < max_attempts
+                    else ""
+                )
+                if not report:
+                    break
+                reviews += 1
+                log_queue.put(("log", f"Starting layout review round {reviews}/{layout_review.REVIEW_ROUNDS}..."))
+                task = layout_review.review_task(report)
+                continue
 
             missing_scene = not (workspace / "scene.py").is_file()
             state = (

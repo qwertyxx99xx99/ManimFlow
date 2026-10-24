@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.request
 
+import layout_review
 import voiceover
 
 
@@ -414,6 +415,7 @@ def run_pi(args):
     video = None
     required_duration = minimum_video_duration(plan)
     details = {}
+    reviews = 0
     for attempt in range(1, args.attempts + 1):
         print(f"Starting Pi agent attempt {attempt}/{args.attempts}...", flush=True)
         process = subprocess.Popen(
@@ -431,7 +433,13 @@ def run_pi(args):
         normalize_nested_workspace(workspace)
         video = newest_video(workspace, required_duration)
         if video:
-            break
+            report = layout_review.audit_layout(workspace, log=lambda m: print(m, flush=True)) if reviews < layout_review.REVIEW_ROUNDS and attempt < args.attempts else ""
+            if not report:
+                break
+            reviews += 1
+            print(f"Starting layout review round {reviews}/{layout_review.REVIEW_ROUNDS}...", flush=True)
+            task = layout_review.review_task(report)
+            continue
         state = (
             "scene.py is missing"
             if not (workspace / "scene.py").is_file()
