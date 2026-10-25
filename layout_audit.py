@@ -4,12 +4,13 @@ from itertools import combinations
 from pathlib import Path
 
 import numpy as np
-from manim import DOWN, LEFT, RIGHT, UP, CoordinateSystem, Line, Mobject, ParametricFunction, Scene, VMobject, config, tempconfig
+from manim import DOWN, LEFT, RIGHT, UP, CoordinateSystem, Line, Mobject, Paragraph, ParametricFunction, Scene, SVGMobject, VMobject, config, tempconfig
 
 MIN_GAP = 0.15
 FRAME_MARGIN = 0.25
 MAX_FINDINGS = 12
-TOUCH_DISTANCE = 0.05
+MAX_LEAVES = 150
+TOUCH_TOLERANCE = 0.05
 BACKGROUND_AREA = 0.5
 CIRCULAR = ("circle", "dot", "ellipse", "annulus", "sector", "arc")
 
@@ -27,6 +28,34 @@ def bounds_of(mob):
         float(mob.get_critical_point(DOWN)[1]),
         float(mob.get_critical_point(UP)[1]),
     )
+
+
+def is_text(mob):
+    return isinstance(mob, (SVGMobject, Paragraph))
+
+
+def leaves(mob):
+    if isinstance(mob, (SVGMobject, Paragraph, CoordinateSystem)) or len(mob.points) > 0 or not mob.submobjects:
+        return [mob]
+    found = []
+    for child in mob.submobjects:
+        found.extend(leaves(child))
+    return found
+
+
+def collect_items(scene):
+    items = []
+    for index, top in enumerate(scene.mobjects, start=1):
+        parts = leaves(top)
+        if len(parts) > MAX_LEAVES:
+            parts = [top]
+        base = label_of(top, index)
+        for position, mob in enumerate(parts, start=1):
+            if len(mob.get_points_defining_boundary()) == 0:
+                continue
+            name = base if len(parts) == 1 and mob is top else f"{base}.{label_of(mob, position)}"
+            items.append((name, mob, bounds_of(mob), index))
+    return items
 
 
 def is_thin(mob):
@@ -60,16 +89,11 @@ def audit_scene(scene):
     frame_x, frame_y = float(config["frame_x_radius"]), float(config["frame_y_radius"])
     frame_area = 4 * frame_x * frame_y
     items = [
-        (label_of(mob, index), mob, bounds_of(mob))
-        for index, mob in enumerate(scene.mobjects, start=1)
-        if len(mob.get_points_defining_boundary()) > 0
-    ]
-    items = [
-        item for item in items
+        item for item in collect_items(scene)
         if (item[2][1] - item[2][0]) * (item[2][3] - item[2][2]) < BACKGROUND_AREA * frame_area
     ]
     findings = []
-    for name, _, (left, right, bottom, top) in items:
+    for name, _, (left, right, bottom, top), _ in items:
         parts = []
         if left < -frame_x + FRAME_MARGIN:
             parts.append(f"left by {-frame_x + FRAME_MARGIN - left:.2f}")
@@ -81,15 +105,17 @@ def audit_scene(scene):
             parts.append(f"top by {top - frame_y + FRAME_MARGIN:.2f}")
         if parts:
             findings.append(f"{name} is outside the safe frame: " + ", ".join(parts))
-    for (name_a, mob_a, a), (name_b, mob_b, b) in combinations(items, 2):
+    for (name_a, mob_a, a, group_a), (name_b, mob_b, b, group_b) in combinations(items, 2):
         if isinstance(mob_a, CoordinateSystem) or isinstance(mob_b, CoordinateSystem):
+            continue
+        if group_a == group_b and not (is_text(mob_a) or is_text(mob_b)):
             continue
         thin_a, thin_b = is_thin(mob_a), is_thin(mob_b)
         if thin_a and thin_b:
             continue
         overlap_x = min(a[1], b[1]) - max(a[0], b[0])
         overlap_y = min(a[3], b[3]) - max(a[2], b[2])
-        if overlap_x > 0 and overlap_y > 0:
+        if overlap_x > TOUCH_TOLERANCE and overlap_y > TOUCH_TOLERANCE:
             if contains(a, b) or contains(b, a) or circular_clear(mob_a, mob_b):
                 continue
             if thin_a != thin_b and not point_in_bounds(mob_a if thin_a else mob_b, b if thin_a else a):
