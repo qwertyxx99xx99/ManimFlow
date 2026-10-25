@@ -29,17 +29,14 @@ Once a valid video exists, `layout_review.py` runs `layout_audit.py`, a headless
 
 ## Model providers
 
-The Streamlit interface currently supports:
+The Streamlit interface offers two providers. The Copilot, Gemini, and Anthropic implementations remain in the code but are hidden:
 
 | Provider | Authentication | Default model |
 | --- | --- | --- |
-| GitHub Copilot | Deployment secret or GitHub device login | `gpt-4o` |
-| Google Gemini | `GEMINI_API_KEY` in Streamlit Secrets | `gemini-2.5-flash` |
-| ChatGPT Codex | Pasted short-lived ChatGPT OAuth access token | `gpt-5.4` |
-| Anthropic | Pasted short-lived Anthropic OAuth access token | `claude-haiku-4-5` |
+| ChatGPT | Sign in with ChatGPT: open the sign-in link, then paste the `127.0.0.1` address your browser fails to load | First model available to your plan |
 | Exa | Public Exa endpoint through the `exa-enhanced` Pi provider (BAML schema alignment, full tool calling) | `google/gemini-2.5-flash` |
 
-Pasted OAuth access tokens remain in the active Streamlit session. ManimFlow does not write them to project files or repository configuration.
+The ChatGPT session (access and refresh tokens) stays in the active Streamlit session and is refreshed automatically. ManimFlow does not write it to project files or repository configuration. The sign-in flow follows Webiome, with the code exchange done by the Streamlit server, so no extra Worker is needed.
 
 ## Main features
 
