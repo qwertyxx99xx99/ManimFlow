@@ -36,7 +36,7 @@ The Streamlit interface offers two providers. The Copilot, Gemini, and Anthropic
 | ChatGPT | Sign in with ChatGPT: open the sign-in link, then paste the `127.0.0.1` address your browser fails to load | First model available to your plan |
 | Exa | Public Exa endpoint through the `exa-enhanced` Pi provider (BAML schema alignment, full tool calling) | `google/gemini-2.5-flash` |
 
-The ChatGPT session (access and refresh tokens) stays in the active Streamlit session and is refreshed automatically. ManimFlow does not write it to project files or repository configuration. The sign-in flow follows Webiome, with the code exchange done by the Streamlit server, so no extra Worker is needed.
+The ChatGPT session (access and refresh tokens) is kept in the active Streamlit session and saved in this browser's localStorage, so a reload or a later visit signs you back in without pasting a URL. Signing out clears it. ManimFlow does not write it to project files or repository configuration. The sign-in flow follows Webiome, with the code exchange done by the Streamlit server, so no extra Worker is needed.
 
 ## Main features
 

@@ -1601,7 +1601,37 @@ if "device_flow" not in st.session_state:
     st.session_state.device_flow = None
 
 gemini_key = secret_value("GEMINI_API_KEY")
+CHATGPT_STORAGE_KEY = "manimflow_chatgpt"
+
+
+def browser_storage(expression, key):
+    try:
+        from streamlit_js_eval import streamlit_js_eval
+    except ImportError:
+        return ""
+    return streamlit_js_eval(js_expressions=expression, key=key)
+
+
+if selected_provider == "chatgpt" and "chatgpt_bundle" not in st.session_state and not st.session_state.get("chatgpt_signed_out"):
+    saved = browser_storage(f"localStorage.getItem('{CHATGPT_STORAGE_KEY}') || ''", "chatgpt_storage_get")
+    if saved is None:
+        st.info("Checking for a saved ChatGPT sign-in...")
+        st.stop()
+    if saved:
+        try:
+            st.session_state.chatgpt_bundle = chatgpt_login.ensure_fresh(json.loads(saved))
+        except Exception:
+            st.session_state.chatgpt_signed_out = True
+            browser_storage(f"localStorage.removeItem('{CHATGPT_STORAGE_KEY}')", "chatgpt_storage_drop")
+
 chatgpt_bundle = st.session_state.get("chatgpt_bundle")
+if chatgpt_bundle:
+    browser_storage(
+        f"localStorage.setItem('{CHATGPT_STORAGE_KEY}', {json.dumps(json.dumps(chatgpt_bundle))})",
+        f"chatgpt_storage_set_{hash(chatgpt_bundle.get('refresh_token', ''))}",
+    )
+elif st.session_state.get("chatgpt_signed_out"):
+    browser_storage(f"localStorage.removeItem('{CHATGPT_STORAGE_KEY}')", "chatgpt_storage_clear")
 anthropic_token = ""
 if selected_provider == "anthropic":
     anthropic_token = st.text_input(
@@ -1646,6 +1676,7 @@ if selected_provider == "chatgpt" and not chatgpt_bundle:
                     st.session_state.chatgpt_pending, pasted
                 )
             st.session_state.pop("chatgpt_pending", None)
+            st.session_state.pop("chatgpt_signed_out", None)
             st.rerun()
         except Exception as exc:
             st.error(str(exc))
@@ -1698,8 +1729,9 @@ with st.sidebar:
         st.caption(f"Agent: Pi · Model: {chatgpt_bundle['default_model']}")
         if chatgpt_bundle.get("email"):
             st.caption(chatgpt_bundle["email"])
-        st.caption("The session lives only in this browser session and is not persisted.")
+        st.caption("Your sign-in is saved in this browser until you sign out.")
         if st.button("Sign out of ChatGPT"):
+            st.session_state.chatgpt_signed_out = True
             st.session_state.pop("chatgpt_bundle", None)
             st.session_state.pop("chatgpt_pending", None)
             st.session_state.pop("chatgpt_paste", None)
