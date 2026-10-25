@@ -37,7 +37,7 @@ The Streamlit interface currently supports:
 | Google Gemini | `GEMINI_API_KEY` in Streamlit Secrets | `gemini-2.5-flash` |
 | ChatGPT Codex | Pasted short-lived ChatGPT OAuth access token | `gpt-5.4` |
 | Anthropic | Pasted short-lived Anthropic OAuth access token | `claude-haiku-4-5` |
-| Exa | Public Exa endpoint through a custom Pi provider | `google/gemini-2.5-flash` |
+| Exa | Public Exa endpoint through the `exa-enhanced` Pi provider (BAML schema alignment, full tool calling) | `google/gemini-2.5-flash` |
 
 Pasted OAuth access tokens remain in the active Streamlit session. ManimFlow does not write them to project files or repository configuration.
 
@@ -54,7 +54,7 @@ Pasted OAuth access tokens remain in the active Streamlit session. ManimFlow doe
 - LLM-suggested YouTube title, description, and tags
 - Resumable YouTube uploads with editable privacy settings
 - Serialized render queue for safe concurrent Streamlit sessions
-- Isolated Node 22 and pinned Pi `0.80.6` runtime installation when required
+- Isolated Node 22 and pinned Pi `1.4.0` and BAML runtime installation when required
 
 ## How it works
 
@@ -141,7 +141,9 @@ For YouTube OAuth, enable YouTube Data API v3, create a Google OAuth Web applica
 | Path | Purpose |
 | --- | --- |
 | `streamlit_app.py` | Main Streamlit product and render orchestration |
-| `pi_extensions/exa_direct.ts` | Direct Exa provider with cleaned output and native Pi tool-call translation |
+| `pi_extensions/exa_enhanced.ts` | Exa provider that turns Pi's tool schemas into a BAML action union, so Exa models make real `read`, `write`, `edit`, and `bash` tool calls |
+| `pi_baml/` | Generated BAML client used by the Exa provider |
+| `exa_runtime.py` | Installs the Exa provider and BAML client into a Pi agent directory |
 | `code_browser_component/` | Read-only Monaco code browser |
 | `browser_storage_component/` | Browser-local encrypted credential storage bridge |
 | `requirements.txt` | Python dependencies |

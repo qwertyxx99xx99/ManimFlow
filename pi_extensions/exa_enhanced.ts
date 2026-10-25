@@ -1,0 +1,492 @@
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  type AssistantMessage,
+  type AssistantMessageEventStream,
+  type Context,
+  type Model,
+  type SimpleStreamOptions,
+  createAssistantMessageEventStream,
+  getCurrentSystemPrompt,
+  getCurrentTools,
+} from "@earendil-works/pi-ai";
+import { b } from "../baml_exa/baml_client/index.ts";
+import TypeBuilder, {
+  type FieldType,
+} from "../baml_exa/baml_client/type_builder.ts";
+import { writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
+
+const EXA_ENDPOINT = "https://demos.exa.ai/chatbot-demo/api/chat/stream";
+const UPSTREAM_MODEL = "google/gemini-2.5-flash";
+const FEEDBACK_PREFIX = "Your previous output was invalid";
+const sequentialOverrides = new WeakMap<object, unknown>();
+
+function activeTools(context: Context): any[] {
+  try {
+    const tools = getCurrentTools((context as any).messages || []);
+    if (Array.isArray(tools) && tools.length) return tools;
+  } catch {
+    // Older Pi releases exposed tools directly on the provider context.
+  }
+  return Array.isArray((context as any).tools) ? (context as any).tools : [];
+}
+
+function activeSystemPrompt(context: Context): string {
+  try {
+    const prompt = getCurrentSystemPrompt((context as any).messages || []);
+    if (prompt) return prompt;
+  } catch {
+    // Older Pi releases exposed the system prompt directly on the context.
+  }
+  return String((context as any).systemPrompt || "");
+}
+
+function restoreToolExecutionModes(context: Context): void {
+  for (const tool of activeTools(context)) {
+    if (!sequentialOverrides.has(tool)) continue;
+    const previous = sequentialOverrides.get(tool);
+    if (previous === undefined) delete (tool as any).executionMode;
+    else (tool as any).executionMode = previous;
+    sequentialOverrides.delete(tool);
+  }
+}
+
+function makeBatchSequential(context: Context, actions: any[]): void {
+  if (actions.length < 2) return;
+  const tool = activeTools(context).find((candidate: any) => candidate.name === actions[0].tool);
+  if (!tool) return;
+  sequentialOverrides.set(tool, (tool as any).executionMode);
+  (tool as any).executionMode = "sequential";
+}
+
+function contextToText(context: Context): string {
+  const messages = context.messages.map((message) => {
+    const content = typeof message.content === "string"
+      ? message.content
+      : message.content
+          .map((part: any) => {
+            switch (part.type) {
+              case "text":
+                return part.text;
+              case "thinking":
+                return `[thinking]\n${part.thinking}`;
+              case "toolCall":
+                return `[already executed tool call ${part.name}: ${JSON.stringify(part.arguments || {})}]`;
+              case "image":
+                return `[image provided here, but unavailable to this model: ${part.mimeType}]`;
+              default:
+                return "";
+            }
+          })
+          .filter(Boolean)
+          .join("\n");
+
+    return `${String(message.role || "user").toUpperCase()}:\n${content}`;
+  });
+
+  return [
+    activeSystemPrompt(context) && `SYSTEM:\n${activeSystemPrompt(context)}`,
+    ...messages,
+  ].filter(Boolean).join("\n\n");
+}
+
+function renderedPrompt(body: any): string {
+  const messages = body?.messages ?? body?.input ?? [];
+  if (!Array.isArray(messages)) return JSON.stringify(body);
+  return messages
+    .map((message: any) => {
+      const content = typeof message?.content === "string"
+        ? message.content
+        : JSON.stringify(message?.content ?? "");
+      return `${String(message?.role || "user").toUpperCase()}:\n${content}`;
+    })
+    .join("\n\n");
+}
+
+function safeTypeName(value: string): string {
+  const words = value.replace(/[^A-Za-z0-9]+/g, " ").trim().split(/\s+/);
+  const name = words.map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join("");
+  return name && /^[A-Za-z]/.test(name) ? name : `Tool${name || "Value"}`;
+}
+
+function scalarFallback(tb: TypeBuilder): FieldType {
+  return tb.union([tb.string(), tb.float(), tb.bool(), tb.null()]);
+}
+
+function schemaToBaml(
+  tb: TypeBuilder,
+  schema: any,
+  nameHint: string,
+  counter: { value: number },
+): FieldType {
+  if (!schema || schema === true) return scalarFallback(tb);
+  if (schema === false) return tb.null();
+
+  if (Object.hasOwn(schema, "const")) {
+    if (typeof schema.const === "string") return tb.literalString(schema.const);
+    if (typeof schema.const === "number" && Number.isInteger(schema.const))
+      return tb.literalInt(schema.const);
+    if (typeof schema.const === "boolean") return tb.literalBool(schema.const);
+  }
+
+  if (Array.isArray(schema.enum) && schema.enum.length) {
+    return tb.union(
+      schema.enum.map((value: unknown) => {
+        if (typeof value === "string") return tb.literalString(value);
+        if (typeof value === "number" && Number.isInteger(value)) return tb.literalInt(value);
+        if (typeof value === "boolean") return tb.literalBool(value);
+        if (value === null) return tb.null();
+        return tb.string();
+      }),
+    );
+  }
+
+  const alternatives = schema.anyOf ?? schema.oneOf;
+  if (Array.isArray(alternatives) && alternatives.length) {
+    return tb.union(
+      alternatives.map((item: any, index: number) =>
+        schemaToBaml(tb, item, `${nameHint}Option${index + 1}`, counter),
+      ),
+    );
+  }
+
+  if (Array.isArray(schema.type)) {
+    return tb.union(
+      schema.type.map((type: string, index: number) =>
+        schemaToBaml(tb, { ...schema, type }, `${nameHint}Type${index + 1}`, counter),
+      ),
+    );
+  }
+
+  if (schema.type === "string") return tb.string();
+  if (schema.type === "integer") return tb.int();
+  if (schema.type === "number") return tb.float();
+  if (schema.type === "boolean") return tb.bool();
+  if (schema.type === "null") return tb.null();
+
+  if (schema.type === "array" || schema.items) {
+    const itemSchema = Array.isArray(schema.items)
+      ? { anyOf: schema.items }
+      : schema.items;
+    return tb.list(schemaToBaml(tb, itemSchema, `${nameHint}Item`, counter));
+  }
+
+  if (schema.type === "object" || schema.properties || schema.additionalProperties) {
+    const properties = schema.properties || {};
+    if (!Object.keys(properties).length && schema.additionalProperties) {
+      const valueType = schema.additionalProperties === true
+        ? scalarFallback(tb)
+        : schemaToBaml(tb, schema.additionalProperties, `${nameHint}Value`, counter);
+      return tb.map(tb.string(), valueType);
+    }
+
+    const className = `${safeTypeName(nameHint)}${counter.value++}`;
+    const objectClass = tb.addClass(className);
+    const required = new Set<string>(Array.isArray(schema.required) ? schema.required : []);
+    for (const [propertyName, propertySchema] of Object.entries<any>(properties)) {
+      let propertyType = schemaToBaml(
+        tb,
+        propertySchema,
+        `${className}${safeTypeName(propertyName)}`,
+        counter,
+      );
+      if (!required.has(propertyName)) propertyType = propertyType.optional();
+      const property = objectClass.addProperty(propertyName, propertyType);
+      if (propertySchema?.description) property.description(String(propertySchema.description));
+    }
+    return objectClass.type();
+  }
+
+  return scalarFallback(tb);
+}
+
+function buildToolTypes(context: Context): TypeBuilder {
+  const tb = new TypeBuilder();
+  const counter = { value: 1 };
+  const actions: FieldType[] = [];
+
+  for (const [index, tool] of activeTools(context).entries()) {
+    const prefix = `${safeTypeName(tool.name)}${index + 1}`;
+    const callClass = tb.addClass(`${prefix}Call`);
+    callClass
+      .addProperty("tool", tb.literalString(tool.name))
+      .description(tool.description || `Call the ${tool.name} tool`);
+    callClass.addProperty(
+      "arguments",
+      schemaToBaml(tb, tool.parameters, `${prefix}Arguments`, counter),
+    );
+    actions.push(callClass.type());
+  }
+
+  actions.push(tb.TextResponse.type());
+  tb.DynamicDecision
+    .addProperty("actions", tb.list(tb.union(actions)))
+    .description("Tool calls execute sequentially in listed order. Select one or more calls, or exactly one text response.");
+  return tb;
+}
+
+async function askExa(prompt: string, signal?: AbortSignal): Promise<string> {
+  const response = await fetch(EXA_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal,
+    body: JSON.stringify({
+      message: prompt,
+      history: [],
+      exaEnabled: false,
+      model: UPSTREAM_MODEL,
+      searchType: "instant",
+    }),
+  });
+  if (!response.ok) {
+    const raw = await response.text();
+    throw new Error(`Exa upstream ${response.status}: ${raw.slice(0, 500)}`);
+  }
+  if (!response.body) throw new Error("Exa returned no response stream");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  let text = "";
+
+  function consume(line: string): boolean {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) return false;
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === "[DONE]") return false;
+    try {
+      const event = JSON.parse(payload);
+      if (typeof event.content !== "string") return false;
+      text += event.content;
+      const marker = text.search(/```followups\b/i);
+      if (marker >= 0) {
+        text = text.slice(0, marker).trimEnd();
+        return true;
+      }
+    } catch {
+      // Ignore keepalives and non-content metadata.
+    }
+    return false;
+  }
+
+  while (true) {
+    const { done, value } = await reader.read();
+    pending += decoder.decode(value, { stream: !done });
+    const lines = pending.split("\n");
+    pending = done ? "" : lines.pop() || "";
+    for (const line of lines) {
+      if (consume(line)) {
+        await reader.cancel();
+        return text;
+      }
+    }
+    if (done) break;
+  }
+  if (pending) consume(pending);
+  if (!text) throw new Error("Exa returned no assistant content");
+  return text;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new Error("Request was aborted");
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+async function feedbackAction(
+  context: Context,
+  content: string,
+  cause: unknown,
+): Promise<any> {
+  if (!activeTools(context).some((tool: any) => tool.name === "bash"))
+    throw new AggregateError(
+      [cause],
+      "Exa recovery requires the bash tool",
+    );
+  await writeFile(resolve(process.cwd(), "last_output_feedback.log"), content, "utf8");
+  return { actions: [{
+    tool: "bash",
+    arguments: {
+      command: "cat -- last_output_feedback.log && : > last_output_feedback.log",
+    },
+  }] };
+}
+
+function emitTextResult(
+  stream: AssistantMessageEventStream,
+  output: AssistantMessage,
+  text: string,
+): void {
+  if (!text.trim()) throw new Error("BAML returned an empty final answer");
+  const block = { type: "text" as const, text: "" };
+  output.content.push(block);
+  const contentIndex = output.content.indexOf(block);
+  stream.push({ type: "text_start", contentIndex, partial: output });
+  block.text = text;
+  stream.push({ type: "text_delta", contentIndex, delta: text, partial: output });
+  stream.push({ type: "text_end", contentIndex, content: block.text, partial: output });
+  output.stopReason = "stop";
+  stream.push({ type: "done", reason: output.stopReason, message: output });
+}
+
+function emitToolCall(
+  stream: AssistantMessageEventStream,
+  output: AssistantMessage,
+  name: string,
+  args: Record<string, unknown>,
+): void {
+  const toolCall = {
+    type: "toolCall" as const,
+    id: `exa-enhanced-${crypto.randomUUID()}`,
+    name,
+    arguments: {} as Record<string, unknown>,
+  };
+  output.content.push(toolCall);
+  const contentIndex = output.content.indexOf(toolCall);
+  stream.push({ type: "toolcall_start", contentIndex, partial: output });
+  toolCall.arguments = args;
+  stream.push({
+    type: "toolcall_delta",
+    contentIndex,
+    delta: JSON.stringify(args),
+    partial: output,
+  });
+  stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
+}
+
+function streamExaBaml(
+  model: Model<any>,
+  context: Context,
+  options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+  const stream = createAssistantMessageEventStream();
+
+  void (async () => {
+    const output: AssistantMessage = {
+      role: "assistant",
+      content: [],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: Date.now(),
+    };
+
+    try {
+      stream.push({ type: "start", partial: output });
+      throwIfAborted(options?.signal);
+      restoreToolExecutionModes(context);
+      const tb = buildToolTypes(context);
+      const conversation = contextToText(context);
+      const request = await b.request.NextAction(conversation, {
+        tb,
+        env: { OPENAI_API_KEY: "unused" },
+      });
+      const prompt = renderedPrompt(request.body.json());
+      throwIfAborted(options?.signal);
+      let modelText = "";
+      let parsed: any;
+      try {
+        modelText = await askExa(prompt, options?.signal);
+      } catch (error) {
+        if (!(error instanceof Error) || error.message !== "Exa returned no assistant content")
+          throw error;
+        parsed = await feedbackAction(context, "Continue with task.\n", error);
+      }
+      throwIfAborted(options?.signal);
+      if (!parsed) {
+        try {
+          parsed = b.parse.NextAction(modelText, {
+            tb,
+            env: { OPENAI_API_KEY: "unused" },
+          });
+        } catch (firstParseError) {
+          parsed = await feedbackAction(
+            context,
+            `${FEEDBACK_PREFIX} and could not be converted into a ` +
+            `Pi text response or tool call. Continue the original task and emit ` +
+            `valid output matching the required schema. Do not repeat the invalid ` +
+            `response and do not return an empty actions list.\n\n` +
+            `Rejected output:\n${modelText}\n`,
+            firstParseError,
+          );
+        }
+      }
+
+      throwIfAborted(options?.signal);
+      const actions = parsed.actions;
+      if (!Array.isArray(actions) || actions.length === 0)
+        throw new Error("BAML returned no actions");
+      if (!actions.every(isPlainObject))
+        throw new Error("BAML returned an invalid action");
+
+      const textActions = actions.filter((action: any) => action.type === "text");
+      if (textActions.length) {
+        if (actions.length !== 1)
+          throw new Error("BAML combined a text response with tool calls");
+        const textAction = textActions[0];
+        if (typeof textAction.text !== "string")
+          throw new Error("BAML returned a text response without text");
+        emitTextResult(stream, output, textAction.text);
+      } else {
+        makeBatchSequential(context, actions);
+        for (const action of actions) {
+          if (typeof action.tool !== "string")
+            throw new Error("BAML returned a tool call without a tool name");
+          if (!activeTools(context).some((tool: any) => tool.name === action.tool))
+            throw new Error(`BAML selected unavailable tool: ${action.tool}`);
+          if (!isPlainObject(action.arguments))
+            throw new Error(`BAML returned invalid arguments for tool: ${action.tool}`);
+          const argumentsWithoutNulls = Object.fromEntries(
+            Object.entries(action.arguments).filter(([, value]) => value != null),
+          );
+          emitToolCall(stream, output, action.tool, argumentsWithoutNulls);
+        }
+        output.stopReason = "toolUse";
+        stream.push({ type: "done", reason: output.stopReason, message: output });
+      }
+      stream.end();
+    } catch (error) {
+      output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+      output.errorMessage = error instanceof Error ? error.message : String(error);
+      stream.push({ type: "error", reason: output.stopReason, error: output });
+      stream.end();
+    }
+  })();
+
+  return stream;
+}
+
+export default function (pi: ExtensionAPI) {
+  pi.registerProvider("exa-enhanced", {
+    name: "Exa Enhanced",
+    baseUrl: EXA_ENDPOINT,
+    apiKey: "exa-public",
+    authHeader: false,
+    api: "exa-enhanced" as any,
+    models: [
+      {
+        id: "google/gemini-2.5-flash",
+        name: "Gemini 2.5 Flash (Exa Enhanced)",
+        reasoning: false,
+        input: ["text"],
+        contextWindow: 128000,
+        maxTokens: 8192,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      },
+    ],
+    streamSimple: streamExaBaml,
+  });
+}

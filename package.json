@@ -1,9 +1,10 @@
 {
   "private": true,
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "1.0.0"
+    "@boundaryml/baml": "0.223.0",
+    "@earendil-works/pi-coding-agent": "1.4.0"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.19.0"
   }
 }

@@ -6,15 +6,15 @@ import sys
 AUDITOR = pathlib.Path(__file__).with_name("layout_audit.py")
 BACKUP = ".review_backup"
 REVIEW_ROUNDS = 2
+REVIEW_FILES = ["@scene.py", "@layout_review.md"]
 
 
 def audit_layout(workspace, log=print):
     if not (workspace / "scene.py").is_file():
         return ""
-    shutil.copy2(AUDITOR, workspace / AUDITOR.name)
     try:
         result = subprocess.run(
-            [sys.executable, AUDITOR.name, "scene.py", "AnimScene"],
+            [sys.executable, str(AUDITOR), "scene.py", "AnimScene"],
             cwd=workspace, capture_output=True, text=True, timeout=300,
         )
     except subprocess.TimeoutExpired:
@@ -23,6 +23,7 @@ def audit_layout(workspace, log=print):
     if result.returncode == 1:
         lines = [l for l in result.stdout.splitlines() if l.startswith(("layout audit", "- "))]
         log("Layout audit flagged issues:\n" + "\n".join(lines))
+        (workspace / "layout_review.md").write_text("# Layout audit findings\n\n" + "\n".join(lines) + "\n")
         (workspace / BACKUP).mkdir(exist_ok=True)
         shutil.copy2(workspace / "scene.py", workspace / BACKUP / "scene.py")
         return "\n".join(lines)
@@ -61,14 +62,14 @@ def settle(workspace, log=print):
 
 def review_task(report):
     return (
-        "ManimFlow ran a geometry audit on the finished scene.py. It reports overlapping objects, "
-        "crowding, and objects outside the frame after each play() call, most important first. "
-        "Do not rewrite scene.py from scratch. Make small targeted changes with the edit tool: "
-        "adjust spacing, scale, or position, or fade out old objects before new ones arrive. "
-        "Treat each finding as a real defect by default. You may ignore one only when it is "
-        "deliberate or a false positive, and then append a line to review_notes.md as: "
-        "IGNORED: <finding> | <reason>. Re-rendering is optional because ManimFlow renders "
-        "scene.py after your edits and keeps the previous video if the revision fails. "
-        "Always apply at least the most important fixes; do not answer with text only.\n\n"
-        f"{report}"
+        "The attached layout_review.md lists layout problems that an automated geometry audit found "
+        "in the attached scene.py (overlapping objects, crowding, objects outside the frame), most "
+        "important first. Your first response must be an edit tool call on scene.py that fixes the "
+        "top findings with small changes: adjust spacing, scale, or position, or fade out old objects "
+        "before new ones arrive. Do not rewrite the file, do not answer with prose, and do not "
+        "apologize. Treat each finding as a real defect unless it is deliberate or a false positive; "
+        "for each one you skip, append a line to review_notes.md as: IGNORED: <finding> | <reason>. "
+        "Re-rendering is optional because ManimFlow renders scene.py after your edits and keeps the "
+        "previous video if the revision fails.\n\n"
+        f"Findings:\n{report}"
     )

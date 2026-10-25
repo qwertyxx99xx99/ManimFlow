@@ -12,11 +12,12 @@ import time
 import urllib.error
 import urllib.request
 
+import exa_runtime
 import layout_review
 import voiceover
 
 
-PI_VERSION = "0.80.6"
+PI_VERSION = "1.4.0"
 COPILOT_BASE = "https://api.individual.githubcopilot.com"
 COPILOT_PROVIDER = "manimflow-copilot"
 COPILOT_MODEL = "gpt-4o"
@@ -184,7 +185,7 @@ def write_project_files(workspace, prompt, plan, require_docs):
     )
 
 
-def write_pi_config(agent_dir, provider, extension):
+def write_pi_config(agent_dir, provider, pi_command):
     agent_dir.mkdir(parents=True, exist_ok=True)
     providers = {}
     if provider == "copilot":
@@ -212,11 +213,7 @@ def write_pi_config(agent_dir, provider, extension):
     (agent_dir / "models.json").write_text(json.dumps({"providers": providers}, indent=2))
     (agent_dir / "settings.json").write_text(json.dumps({"telemetry": False, "quietStartup": True}, indent=2))
     if provider == "exa":
-        if not extension or not extension.is_file():
-            raise RuntimeError("The Exa Pi extension is required for Exa runs.")
-        destination = agent_dir / "extensions"
-        destination.mkdir()
-        shutil.copy2(extension, destination / "exa_direct.ts")
+        exa_runtime.install_exa_extension(agent_dir, pi_command)
 
 
 def video_duration(path):
@@ -372,15 +369,14 @@ def run_pi(args):
     if args.provider == "copilot" and not token:
         raise RuntimeError(f"{args.token_env} is required.")
 
-    if args.provider == "copilot":
-        clone_docs(workspace)
+    clone_docs(workspace)
     print("Planning scenes...", flush=True)
     plan = plan_animation(args.provider, token, args.prompt)
     print(f"\nScene plan:\n{plan}\n", flush=True)
-    write_project_files(workspace, args.prompt, plan, args.provider == "copilot")
-    write_pi_config(agent_dir, args.provider, args.exa_extension)
+    write_project_files(workspace, args.prompt, plan, True)
+    write_pi_config(agent_dir, args.provider, args.pi)
 
-    provider = "exa-direct" if args.provider == "exa" else COPILOT_PROVIDER
+    provider = exa_runtime.EXA_PROVIDER if args.provider == "exa" else COPILOT_PROVIDER
     model = EXA_MODEL if args.provider == "exa" else COPILOT_MODEL
     env = os.environ.copy()
     env["PI_CODING_AGENT_DIR"] = str(agent_dir)
@@ -405,11 +401,7 @@ def run_pi(args):
     if args.provider == "copilot":
         command.insert(7, "--no-extensions")
     task = (
-        "Implement the complete animation described in plan.md immediately. Use file and bash "
-        "tools autonomously, repeatedly render, diagnose failures, and repair until a valid MP4 exists. "
-        "Do not ask questions."
-        if args.provider == "exa"
-        else "First satisfy the documentation gate in AGENTS.md using local manim-docs/. Then implement "
+        "First satisfy the documentation gate in AGENTS.md using local manim-docs/. Then implement "
         "all of plan.md autonomously, repeatedly render, diagnose failures, and repair until a valid MP4 exists."
     )
     reads = set()
@@ -417,29 +409,36 @@ def run_pi(args):
     required_duration = minimum_video_duration(plan)
     details = {}
     reviews = 0
+    review_files = []
+    last_report = ""
     for attempt in range(1, args.attempts + 1):
         print(f"Starting Pi agent attempt {attempt}/{args.attempts}...", flush=True)
         process = subprocess.Popen(
-            [*command, task], cwd=workspace, env=env, stdin=subprocess.DEVNULL,
+            [*command, *review_files, task], cwd=workspace, env=env, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
         for line in process.stdout or []:
-            if args.provider == "copilot":
-                observe_doc_read(line, workspace, reads)
+            observe_doc_read(line, workspace, reads)
             update = concise_event(line, details)
             if update:
                 print(update, flush=True)
         code = process.wait()
         print(f"Pi attempt {attempt} exit code: {code}", flush=True)
         normalize_nested_workspace(workspace)
+        review_files = []
         if reviews:
             layout_review.settle(workspace, log=lambda m: print(m, flush=True))
         video = newest_video(workspace, required_duration)
         if video:
             report = layout_review.audit_layout(workspace, log=lambda m: print(m, flush=True)) if reviews < layout_review.REVIEW_ROUNDS and attempt < args.attempts else ""
+            if report and report == last_report:
+                print("Layout findings are unchanged after the last review round; ending review.", flush=True)
+                report = ""
+            last_report = report
             if not report:
                 break
             reviews += 1
+            review_files = layout_review.REVIEW_FILES
             print(f"Starting layout review round {reviews}/{layout_review.REVIEW_ROUNDS}...", flush=True)
             task = layout_review.review_task(report)
             continue
@@ -455,9 +454,8 @@ def run_pi(args):
         )
     if not video:
         raise RuntimeError(f"Pi did not produce a valid MP4 after {args.attempts} attempts.")
-    if args.provider == "copilot":
-        validate_docs(workspace, reads)
-        print(f"Documentation gate passed -> {len(reads)} distinct files read", flush=True)
+    validate_docs(workspace, reads)
+    print(f"Documentation gate passed -> {len(reads)} distinct files read", flush=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     chat = exa_chat if args.provider == "exa" else lambda m: copilot_chat(token, m)
     if args.no_voiceover:
@@ -474,7 +472,6 @@ def parse_args():
     parser.add_argument("--workspace", type=pathlib.Path, default=pathlib.Path("manim_output"))
     parser.add_argument("--output", type=pathlib.Path, default=pathlib.Path("animation.mp4"))
     parser.add_argument("--pi", default=shutil.which("pi") or "pi")
-    parser.add_argument("--exa-extension", type=pathlib.Path)
     parser.add_argument("--token-env", default="COPILOT_TOKEN")
     parser.add_argument("--no-voiceover", action="store_true")
     parser.add_argument("--attempts", type=int, default=6)

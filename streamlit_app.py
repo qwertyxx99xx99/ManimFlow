@@ -18,6 +18,7 @@ import urllib.parse
 import urllib.error
 import urllib.request
 
+import exa_runtime
 import layout_review
 import voiceover
 import streamlit as st
@@ -36,7 +37,7 @@ APP_DIR = pathlib.Path(__file__).resolve().parent
 LOCAL_PI = APP_DIR / "node_modules" / ".bin" / "pi"
 RUNTIME_DIR = pathlib.Path("/tmp/manimflow_pi_runtime")
 NODE_DIR = pathlib.Path("/tmp/manimflow_node")
-PI_VERSION = "1.0.0"
+PI_VERSION = "1.4.0"
 _PI_INSTALL_LOCK = threading.Lock()
 MANIM_DOCS_REPO = pathlib.Path("/tmp/manim_community_docs")
 MANIM_DOCS_URL = "https://github.com/ManimCommunity/manim.git"
@@ -53,7 +54,6 @@ EXA_ENDPOINT = os.environ.get(
     "EXA_ENDPOINT", "https://demos.exa.ai/chatbot-demo/api/chat/stream"
 )
 EXA_MODEL = os.environ.get("EXA_MODEL", "google/gemini-2.5-flash")
-EXA_EXTENSION = APP_DIR / "pi_extensions" / "exa_direct.ts"
 YOUTUBE_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 YOUTUBE_STORAGE_KEY = "manimflow.youtube.credentials.v1"
 _browser_storage = components.declare_component(
@@ -704,6 +704,7 @@ def resolve_pi_command(log_queue):
     system_node = shutil.which("node")
     if (
         LOCAL_PI.exists()
+        and exa_runtime.exa_ready(LOCAL_PI)
         and system_node
         and node_major(system_node) >= 22
         and pi_version(LOCAL_PI, system_node) == PI_VERSION
@@ -712,6 +713,7 @@ def resolve_pi_command(log_queue):
     installed = shutil.which("pi")
     if (
         installed
+        and exa_runtime.exa_ready(installed)
         and system_node
         and node_major(system_node) >= 22
         and pi_version(installed, system_node) == PI_VERSION
@@ -723,6 +725,7 @@ def resolve_pi_command(log_queue):
     runtime_node = str(isolated_node) if isolated_node.exists() else system_node
     if (
         runtime_pi.exists()
+        and exa_runtime.exa_ready(runtime_pi)
         and runtime_node
         and node_major(runtime_node) >= 22
         and pi_version(runtime_pi, runtime_node) == PI_VERSION
@@ -734,6 +737,7 @@ def resolve_pi_command(log_queue):
         runtime_node = str(isolated_node) if isolated_node.exists() else shutil.which("node")
         if (
             runtime_pi.exists()
+            and exa_runtime.exa_ready(runtime_pi)
             and runtime_node
             and node_major(runtime_node) >= 22
             and pi_version(runtime_pi, runtime_node) == PI_VERSION
@@ -771,6 +775,7 @@ def resolve_pi_command(log_queue):
                 "--no-audit",
                 "--no-fund",
                 f"@earendil-works/pi-coding-agent@{PI_VERSION}",
+                f"@boundaryml/baml@{exa_runtime.BAML_VERSION}",
             ],
             check=True,
             env=install_env,
@@ -781,7 +786,7 @@ def resolve_pi_command(log_queue):
         return str(runtime_pi)
 
 
-def write_pi_config(agent_dir, provider):
+def write_pi_config(agent_dir, provider, pi_command=None):
     agent_dir.mkdir(parents=True, exist_ok=True)
     models = {
         "providers": {
@@ -846,11 +851,7 @@ def write_pi_config(agent_dir, provider):
         json.dumps({"telemetry": False, "quietStartup": True}, indent=2)
     )
     if provider == "exa":
-        if not EXA_EXTENSION.is_file():
-            raise RuntimeError(f"Exa Pi extension is missing: {EXA_EXTENSION}")
-        extensions_dir = agent_dir / "extensions"
-        extensions_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(EXA_EXTENSION, extensions_dir / "exa_direct.ts")
+        exa_runtime.install_exa_extension(agent_dir, pi_command)
 
 
 def prune_manim_docs(docs_dir):
@@ -977,44 +978,6 @@ def video_duration(path):
         return float(result.stdout.strip())
     except (OSError, ValueError, subprocess.SubprocessError):
         return 0.0
-
-
-def render_scene_directly(workspace, log_queue):
-    command = [
-        sys.executable,
-        "-m",
-        "manim",
-        "-pql",
-        "--disable_caching",
-        "scene.py",
-        "AnimScene",
-    ]
-    log_queue.put(("log", "ManimFlow is rendering the current scene draft..."))
-    process = subprocess.Popen(
-        command,
-        cwd=str(workspace),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        text=True,
-        bufsize=1,
-    )
-    recent_output = []
-    if process.stdout is not None:
-        for output_line in process.stdout:
-            text = output_line.rstrip()
-            if not text:
-                continue
-            recent_output.append(text)
-            if len(recent_output) > 250:
-                del recent_output[0]
-            log_queue.put(("log", text[:1500]))
-    return_code = process.wait()
-    diagnostic = "\n".join(recent_output)
-    (workspace / "render_error.log").write_text(
-        f"Command: {' '.join(command)}\nExit code: {return_code}\n\n{diagnostic}\n"
-    )
-    return return_code
 
 
 def minimum_video_duration(plan):
@@ -1266,13 +1229,12 @@ def _run_render(provider, credential, user_prompt, log_queue, with_voiceover=Tru
 
     try:
         pi_command = resolve_pi_command(log_queue)
-        if provider != "exa":
-            docs_dir = ensure_manim_docs(log_queue)
-            shutil.copytree(
-                docs_dir,
-                workspace / "manim-docs",
-                copy_function=os.link,
-            )
+        docs_dir = ensure_manim_docs(log_queue)
+        shutil.copytree(
+            docs_dir,
+            workspace / "manim-docs",
+            copy_function=os.link,
+        )
 
         log_queue.put(("log", "Planning scenes..."))
         planner_messages = [
@@ -1302,7 +1264,7 @@ def _run_render(provider, credential, user_prompt, log_queue, with_voiceover=Tru
             pi_model = ANTHROPIC_MODEL
         elif provider == "exa":
             plan = exa_chat(planner_messages, log_queue)
-            pi_provider = "exa-direct"
+            pi_provider = exa_runtime.EXA_PROVIDER
             pi_model = EXA_MODEL
         else:
             plan = copilot_chat(credential, planner_messages, log_queue)
@@ -1310,8 +1272,8 @@ def _run_render(provider, credential, user_prompt, log_queue, with_voiceover=Tru
             pi_model = COPILOT_MODEL
         log_queue.put(("plan", plan))
 
-        write_project_files(workspace, user_prompt, plan, require_docs=provider != "exa")
-        write_pi_config(agent_dir, provider)
+        write_project_files(workspace, user_prompt, plan, require_docs=True)
+        write_pi_config(agent_dir, provider, pi_command)
 
         env = os.environ.copy()
         if provider == "gemini":
@@ -1370,24 +1332,13 @@ def _run_render(provider, credential, user_prompt, log_queue, with_voiceover=Tru
             )
         log_queue.put(("log", f"Pi model ready → {pi_provider}/{pi_model}"))
 
-        if provider == "exa":
-            task = (
-                "Begin implementation now. The plan is already attached, so do not reread it, "
-                "list files, discuss feasibility, estimate time, apologize, or describe what you "
-                "would do. Your first response must be a write tool call creating scene.py with a "
-                "complete first draft covering every planned scene. After that tool completes, run "
-                "the exact Manim command in AGENTS.md with bash and keep using tools to repair every "
-                "failure until the MP4 renders. A partial first draft is acceptable; a text-only "
-                "response is not."
-            )
-        else:
-            task = (
-                "First satisfy the mandatory documentation gate in AGENTS.md using only the "
-                "local manim-docs/ checkout. Then implement the complete animation described "
-                "in plan.md. Use your file and bash tools autonomously. Run the Manim test after "
-                "edits, diagnose failures, and keep repairing until it renders successfully. "
-                "Do not ask questions."
-            )
+        task = (
+            "First satisfy the mandatory documentation gate in AGENTS.md using only the "
+            "local manim-docs/ checkout. Then implement the complete animation described "
+            "in plan.md. Use your file and bash tools autonomously. Run the Manim test after "
+            "edits, diagnose failures, and keep repairing until it renders successfully. "
+            "Do not ask questions."
+        )
         command_prefix = [
             pi_command,
             "--mode",
@@ -1412,11 +1363,11 @@ def _run_render(provider, credential, user_prompt, log_queue, with_voiceover=Tru
         required_duration = minimum_video_duration(plan)
         max_attempts = 6
         reviews = 0
+        review_files = []
+        last_report = ""
         for attempt in range(1, max_attempts + 1):
             log_queue.put(("log", f"Starting Pi agent attempt {attempt}/{max_attempts}..."))
-            attempt_command = list(command_prefix)
-            if provider == "exa" and (workspace / "render_error.log").is_file():
-                attempt_command.append("@render_error.log")
+            attempt_command = list(command_prefix) + review_files
             process = subprocess.Popen(
                 [*attempt_command, task],
                 cwd=str(workspace),
@@ -1451,8 +1402,7 @@ def _run_render(provider, credential, user_prompt, log_queue, with_voiceover=Tru
                     output_started = True
                     if is_rate_limit_event(output_line):
                         rate_limited = True
-                    if provider != "exa":
-                        observe_documentation_read(output_line, workspace, observed_doc_reads)
+                    observe_documentation_read(output_line, workspace, observed_doc_reads)
                     update = concise_pi_event(output_line, pi_tool_details)
                     if update:
                         log_queue.put(("log", update))
@@ -1467,29 +1417,24 @@ def _run_render(provider, credential, user_prompt, log_queue, with_voiceover=Tru
 
             if normalize_nested_workspace(workspace):
                 log_queue.put(("log", "Normalized accidental nested manim_output/ workspace."))
+            review_files = []
             if reviews:
                 layout_review.settle(workspace, log=lambda m: log_queue.put(("log", m)))
             video = newest_video(workspace, required_duration)
-            if provider == "exa" and video is None and (workspace / "scene.py").is_file():
-                render_scene_directly(workspace, log_queue)
-                video = newest_video(workspace, required_duration)
-                if video is None:
-                    diagnostic = workspace / "render_error.log"
-                    with diagnostic.open("a") as output:
-                        output.write(
-                            f"\nRequired final duration: at least {required_duration:g} seconds.\n"
-                            "No qualifying media/**/AnimScene.mp4 exists yet. Repair scene.py using "
-                            "the errors above, or expand the animation if the render is too short.\n"
-                        )
             if video is not None:
                 report = (
                     layout_review.audit_layout(workspace, log=lambda m: log_queue.put(("log", m)))
                     if reviews < layout_review.REVIEW_ROUNDS and attempt < max_attempts
                     else ""
                 )
+                if report and report == last_report:
+                    log_queue.put(("log", "Layout findings are unchanged after the last review round; ending review."))
+                    report = ""
+                last_report = report
                 if not report:
                     break
                 reviews += 1
+                review_files = layout_review.REVIEW_FILES
                 log_queue.put(("log", f"Starting layout review round {reviews}/{layout_review.REVIEW_ROUNDS}..."))
                 task = layout_review.review_task(report)
                 continue
@@ -1513,35 +1458,17 @@ def _run_render(provider, credential, user_prompt, log_queue, with_voiceover=Tru
                 log_queue.put(
                     ("log", f"Attempt {attempt} was incomplete ({state}); continuing autonomously...")
                 )
-                if provider == "exa" and missing_scene:
-                    task = (
-                        "Create scene.py now. Your first response must be a write tool call, not text, "
-                        "an apology, a plan, a read, or a directory listing. The attached plan contains "
-                        "all required context. Write a complete AnimScene implementation, then run the "
-                        "exact Manim command from AGENTS.md and repair errors with tools. Begin with write."
-                    )
-                elif provider == "exa":
-                    task = (
-                        f"The attached render_error.log shows why the current scene.py did not produce "
-                        f"a valid AnimScene.mp4 of at least {required_duration:g} seconds. Your first "
-                        "response must be an edit tool call repairing scene.py from that exact diagnostic. "
-                        "Do not rerun Manim, reread files, answer with prose, or apologize; ManimFlow will "
-                        "render automatically after your edit. Make the most complete repair possible in "
-                        "one edit call."
-                    )
-                else:
-                    task = (
-                        f"The previous attempt exited prematurely: {state}. Continue from the existing "
-                        "workspace; do not restart or merely explain. Inspect every current file, finish "
-                        "scene.py and all required helpers, run the exact Manim test from AGENTS.md, fix "
-                        "all failures, and verify that a non-empty MP4 exists before stopping."
-                    )
+                task = (
+                    f"The previous attempt exited prematurely: {state}. Continue from the existing "
+                    "workspace; do not restart or merely explain. Inspect every current file, finish "
+                    "scene.py and all required helpers, run the exact Manim test from AGENTS.md, fix "
+                    "all failures, and verify that a non-empty MP4 exists before stopping."
+                )
 
-        if provider != "exa":
-            validate_documentation_gate(workspace, observed_doc_reads)
-            log_queue.put(
-                ("log", f"Documentation gate passed → {len(observed_doc_reads)} distinct files read")
-            )
+        validate_documentation_gate(workspace, observed_doc_reads)
+        log_queue.put(
+            ("log", f"Documentation gate passed → {len(observed_doc_reads)} distinct files read")
+        )
         if video is None:
             raise RuntimeError(
                 f"Pi did not produce a valid MP4 after {max_attempts} autonomous attempts."
